@@ -670,7 +670,6 @@ LRESULT CALLBACK ListSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lP
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-
     case WM_NCCALCSIZE:
     {
         if (wParam == TRUE) {
@@ -678,22 +677,52 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         break;
     }
-
     case WM_NCHITTEST:
     {
-        LRESULT hit = DefWindowProc(hWnd, msg, wParam, lParam);
-
-        if (hit >= HTLEFT && hit <= HTBOTTOMRIGHT) {
-            return hit;
+        // DWMにヒットテストを試行させます。多くの場合、これでリサイズ境界が処理されます。
+        LRESULT result;
+        if (DwmDefWindowProc(hWnd, msg, wParam, lParam, &result)) {
+            return result;
         }
 
+        // DWMが処理しなかった場合に備え、手動でリサイズ境界を判定します。
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+
+        // ウィンドウのスクリーン座標を取得
+        RECT rcWindow;
+        GetWindowRect(hWnd, &rcWindow);
+
+        // ウィンドウが最大化または最小化されていない場合のみリサイズを許可
+        if (!IsZoomed(hWnd) && !IsIconic(hWnd)) {
+            int borderWidth = 8; // マウスを検出する境界の幅
+
+            // 4隅の判定
+            if (pt.x >= rcWindow.left && pt.x < rcWindow.left + borderWidth &&
+                pt.y >= rcWindow.top && pt.y < rcWindow.top + borderWidth) return HTTOPLEFT;
+            if (pt.x < rcWindow.right && pt.x >= rcWindow.right - borderWidth &&
+                pt.y >= rcWindow.top && pt.y < rcWindow.top + borderWidth) return HTTOPRIGHT;
+            if (pt.x >= rcWindow.left && pt.x < rcWindow.left + borderWidth &&
+                pt.y < rcWindow.bottom && pt.y >= rcWindow.bottom - borderWidth) return HTBOTTOMLEFT;
+            if (pt.x < rcWindow.right && pt.x >= rcWindow.right - borderWidth &&
+                pt.y < rcWindow.bottom && pt.y >= rcWindow.bottom - borderWidth) return HTBOTTOMRIGHT;
+
+            // 4辺の判定
+            if (pt.x >= rcWindow.left && pt.x < rcWindow.left + borderWidth) return HTLEFT;
+            if (pt.x < rcWindow.right && pt.x >= rcWindow.right - borderWidth) return HTRIGHT;
+            if (pt.y >= rcWindow.top && pt.y < rcWindow.top + borderWidth) return HTTOP;
+            if (pt.y < rcWindow.bottom && pt.y >= rcWindow.bottom - borderWidth) return HTBOTTOM;
+        }
+
+        // 手動判定の後、カスタムUIのヒットテストを行います。
+        // マウス座標をクライアント座標に変換
         ScreenToClient(hWnd, &pt);
 
+        // 自前のキャプションボタンの判定
         if (PtInRect(&g_rcMinButton, pt)) return HTMINBUTTON;
         if (PtInRect(&g_rcMaxButton, pt)) return HTMAXBUTTON;
         if (PtInRect(&g_rcCloseButton, pt)) return HTCLOSE;
 
+        // タイトルバー領域（タブや空き領域）の判定
         if (pt.y < 32) {
             TCHITTESTINFO hti = { {pt.x, pt.y}, 0 };
             int tabItem = TabCtrl_HitTest(hTab, &hti);
@@ -702,13 +731,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 GetWindowRect(hAddButton, &rcAddButton);
                 MapWindowPoints(HWND_DESKTOP, hWnd, (LPPOINT)&rcAddButton, 2);
                 if (!PtInRect(&rcAddButton, pt)) {
-                    return HTCAPTION;
+                    return HTCAPTION; // ドラッグでウィンドウ移動
                 }
             }
         }
+
+        // 上記のいずれにも該当しない場合はクライアント領域
         return HTCLIENT;
     }
-
     case WM_NCLBUTTONUP:
     {
         switch (wParam) {
@@ -729,10 +759,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     {
         hFont = CreateFontW(20, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, 0, L"Segoe UI");
 
-        //MARGINS margins = { -1 };
-        //DwmExtendFrameIntoClientArea(hWnd, &margins);
-
-        //EnableThemeDialogTexture(hWnd, ETDT_ENABLE);
+        MARGINS margins = { 0, 0, 30, 0};
+        DwmExtendFrameIntoClientArea(hWnd, &margins);
+        SetWindowPos(hWnd, NULL, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER);
 
         hTab = CreateWindowW(WC_TABCONTROLW, 0, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_OWNERDRAWFIXED | TCS_BUTTONS,
             0, 0, 0, 0, hWnd, (HMENU)IDC_TAB, ((LPCREATESTRUCT)lParam)->hInstance, NULL);
@@ -740,7 +769,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         TabCtrl_SetPadding(hTab, 18, 4);
         SetWindowSubclass(hTab, TabSubclassProc, 0, 0);
 
-        hAddButton = CreateWindowW(L"BUTTON", L"+", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        hAddButton = CreateWindowW(L"BUTTON", L"+", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, // ★修正点1: BS_OWNERDRAW に変更
             0, 0, 24, 24, hWnd, (HMENU)IDC_ADD_TAB_BUTTON, ((LPCREATESTRUCT)lParam)->hInstance, NULL);
         SendMessage(hAddButton, WM_SETFONT, (WPARAM)hFont, TRUE);
 
@@ -800,20 +829,43 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hWnd, &ps);
 
-        // ★ 修正点: 背景描画をDWMに完全に任せるため、FillRectを削除
-        // RECT rcClient;
-        // GetClientRect(hWnd, &rcClient);
-        // FillRect(hdc, &rcClient, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        // 背景描画はDWMに任せるため、FillRectは不要（元のコードでもコメントアウト済み）
 
         DrawCaptionButtons(hdc, hWnd);
         EndPaint(hWnd, &ps);
-        return 0;
+        return 0; // ★修正点5: DefWindowProcを呼ばないように return 0; にする
     }
-    break;
 
     case WM_DRAWITEM:
     {
         LPDRAWITEMSTRUCT lpdis = (LPDRAWITEMSTRUCT)lParam;
+
+        if (lpdis->CtlID == IDC_ADD_TAB_BUTTON) {
+            HTHEME hTheme = OpenThemeData(lpdis->hwndItem, L"BUTTON");
+            if (hTheme) {
+                HDC hdc = lpdis->hDC;
+                RECT rc = lpdis->rcItem;
+
+                // ボタンの状態を決定 (通常、ホバー、押下)
+                int iState = PBS_NORMAL;
+                if (lpdis->itemState & ODS_SELECTED) iState = PBS_PRESSED;
+                else if (lpdis->itemState & ODS_HOTLIGHT) iState = PBS_HOT;
+
+                // テーマ API を使ってボタンの背景を描画
+                DrawThemeBackground(hTheme, hdc, BP_PUSHBUTTON, iState, &rc, NULL);
+
+                // DrawThemeTextEx を使ってテキスト(+)を白で描画
+                WCHAR szText[2] = L"+";
+                DTTOPTS dttOpts = { sizeof(dttOpts) };
+                dttOpts.dwFlags = DTT_COMPOSITED | DTT_TEXTCOLOR;// | DTT_CENTER;
+                dttOpts.crText = RGB(0, 0, 0); // テキストの色を白に設定
+                DrawThemeTextEx(hTheme, hdc, BP_PUSHBUTTON, iState, szText, -1, DT_CENTER | DT_VCENTER | DT_SINGLELINE, &rc, &dttOpts);
+
+                CloseThemeData(hTheme);
+            }
+            return TRUE; // 処理済み
+        }
+
         if (lpdis->CtlID == IDC_TAB) {
             HDC hdc = lpdis->hDC;
             RECT rcItem = lpdis->rcItem;
@@ -1332,14 +1384,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPreInst, LPWSTR pCmdLine, in
         hInstance,
         LoadIcon(hInstance, MAKEINTRESOURCE(IDI_ICON1)),
         LoadCursor(0,IDC_ARROW),
-        (HBRUSH)(COLOR_WINDOW + 1),
+        // (HBRUSH)(COLOR_WINDOW + 1), // 変更前
+        (HBRUSH)GetStockObject(BLACK_BRUSH), // ★修正点1: DWMのために背景を黒にする
         0,
         szClassName
     };
     RegisterClassW(&wndclass);
     HWND hWnd = CreateWindowEx(0,
         szClassName, L"タブファイラ",
-        WS_OVERLAPPED | WS_THICKFRAME | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CLIPCHILDREN,
+        WS_POPUP | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CLIPCHILDREN, // ★修正点2: スタイルからWS_CAPTIONを削除
         CW_USEDEFAULT, 0, 900, 600,
         0, 0, hInstance, 0);
     ShowWindow(hWnd, SW_SHOWDEFAULT);
