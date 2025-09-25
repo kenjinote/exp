@@ -19,6 +19,7 @@
 #include <uxtheme.h>
 #include <vssym32.h>
 #include <Aclapi.h>
+#include <lm.h>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -27,6 +28,7 @@
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "netapi32.lib")
 
 #define IDC_TAB 1000
 #define LIST_ID_BASE 2001
@@ -192,7 +194,31 @@ std::wstring GetFileOwnerW(const WCHAR* filePath) {
             szDomainName,
             &dwDomainNameSize,
             &eUse)) {
-            ownerName = szAccountName;
+
+            // アカウントがユーザーの場合、フルネームの取得を試みる
+            if (eUse == SidTypeUser) {
+                USER_INFO_2* pUserInfo = nullptr;
+                // ローカルユーザーとして情報の取得を試みる
+                if (NetUserGetInfo(NULL, szAccountName, 2, (LPBYTE*)&pUserInfo) == NERR_Success) {
+                    // フルネームが設定されていれば、それを使用する
+                    if (pUserInfo->usri2_full_name && wcslen(pUserInfo->usri2_full_name) > 0) {
+                        ownerName = pUserInfo->usri2_full_name;
+                    }
+                    else {
+                        // フルネームがなければアカウント名をそのまま使用
+                        ownerName = szAccountName;
+                    }
+                    NetApiBufferFree(pUserInfo);
+                }
+                else {
+                    // NetUserGetInfoが失敗した場合（ドメインユーザー等）はアカウント名を使用
+                    ownerName = szAccountName;
+                }
+            }
+            else {
+                // ユーザー以外（グループ等）の場合はアカウント名をそのまま使用
+                ownerName = szAccountName;
+            }
         }
         else {
             ownerName = L"N/A";
@@ -425,6 +451,24 @@ void DoCopyCut(HWND hWnd, bool isCut) {
                 tsv_text += L'\t';
 
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                    if (wcscmp(fd.cFileName, L"..") != 0) {
+                        switch (info.sizeState) {
+                        case SizeCalculationState::Completed:
+                            // 計算完了：計算済みサイズをフォーマットして追加
+                            StrFormatByteSizeW(info.calculatedSize, tempBuffer, ARRAYSIZE(tempBuffer));
+                            tsv_text += tempBuffer;
+                            break;
+                        case SizeCalculationState::InProgress:
+                        case SizeCalculationState::NotStarted:
+                            // 計測中
+                            tsv_text += L"計測中...";
+                            break;
+                        case SizeCalculationState::Error:
+                            // エラー
+                            tsv_text += L"アクセス不可";
+                            break;
+                        }
+                    }
                 }
                 else {
                     ULARGE_INTEGER sz = { fd.nFileSizeLow, fd.nFileSizeHigh };
