@@ -1075,15 +1075,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ListDirectory(pData);
             UpdateSortMark(pData);
             break;
-        case ID_ACCELERATOR_COPY:
-            DoCopyCut(hWnd, false);
-            break;
-        case ID_ACCELERATOR_CUT:
-            DoCopyCut(hWnd, true);
-            break;
-        case ID_ACCELERATOR_PASTE:
-            DoPaste(hWnd);
-            break;
         case ID_ACCELERATOR_NEW_TAB:
             AddNewTab(hWnd, pData->currentPath);
             break;
@@ -1215,15 +1206,28 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                     break;
                     case 'A':
-                    {
                         if (GetKeyState(VK_CONTROL) & 0x8000) {
 							int itemCount = ListView_GetItemCount(pData->hList);
 							for (int i = 0; i < itemCount; ++i) {
 								ListView_SetItemState(pData->hList, i, LVIS_SELECTED, LVIS_SELECTED);
 							}
                         }
-                    }
-                    break;
+                        break;
+                    case 'C':
+                        if (GetKeyState(VK_CONTROL) & 0x8000) {
+                            DoCopyCut(hWnd, false);
+                        }
+                        break;
+                    case 'X':
+                        if (GetKeyState(VK_CONTROL) & 0x8000) {
+                            DoCopyCut(hWnd, true);
+                        }
+                        break;
+                    case 'V':
+                        if (GetKeyState(VK_CONTROL) & 0x8000) {
+                            DoPaste(hWnd);
+                        }
+                        break;
                     }
                 }
                 break;
