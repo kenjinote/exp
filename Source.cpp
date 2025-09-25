@@ -1,4 +1,6 @@
-﻿#pragma comment(linker,"\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+﻿#define _WIN32_WINNT 0x0A00 // Windows 10 をターゲットにする
+
+#pragma comment(linker,"\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 #include <windows.h>
 #include <windowsx.h>
@@ -7,7 +9,7 @@
 #include <shellapi.h>
 #include <pathcch.h>
 #include <strsafe.h>
-#include "resource.h"
+#include "resource.h" // resource.h に IDR_ACCELERATOR1 と IDI_ICON1 の定義が必要です
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -31,13 +33,15 @@
 #define IDC_ADD_TAB_BUTTON 3001
 #define IDC_PATH_EDIT 3002
 #define SEARCH_TIMER_ID 1
+#define FILTER_TIMER_ID 2
+#define WM_APP_FOLDER_SIZE_CALCULATED (WM_APP + 1)
 
 // フラットデザイン用のカラー定義
-#define FLATUI_BACKGROUND RGB(240, 240, 240) // 全体の背景色
-#define FLATUI_ACTIVE_TAB RGB(255, 255, 255) // アクティブなタブの背景色
-#define FLATUI_TEXT       RGB(0, 0, 0)         // テキストの色
-#define FLATUI_ACCENT     RGB(0, 120, 215)     // アクティブなタブを示すアクセントカラー
-#define FLATUI_SEPARATOR  RGB(220, 220, 220) // タブ間の区切り線の色
+#define FLATUI_BACKGROUND RGB(240, 240, 240)
+#define FLATUI_ACTIVE_TAB RGB(255, 255, 255)
+#define FLATUI_TEXT       RGB(0, 0, 0)
+#define FLATUI_ACCENT     RGB(0, 120, 215)
+#define FLATUI_SEPARATOR  RGB(220, 220, 220)
 
 // SDKのバージョンによっては定義されていないため、手動で定義する
 #ifndef TCBS_NORMAL
@@ -49,7 +53,6 @@
 #define TABP_CLOSEBUTTON 8
 #endif
 
-// キャプションボタンの非アクティブ状態
 #ifndef MINBS_INACTIVE
 #define MINBS_INACTIVE 5
 #endif
@@ -63,7 +66,6 @@
 #define CBS_INACTIVE 5
 #endif
 
-// キャプションボタンの押下状態
 #ifndef MINBS_PUSHED
 #define MINBS_PUSHED 3
 #endif
@@ -77,20 +79,41 @@
 #define CBS_PUSHED 3
 #endif
 
+enum class SizeCalculationState {
+    NotStarted,
+    InProgress,
+    Completed,
+    Error
+};
+
 struct FileInfo {
     WIN32_FIND_DATAW findData;
     std::wstring owner;
+    ULONGLONG calculatedSize;
+    SizeCalculationState sizeState;
 };
 
 struct ExplorerTabData {
     HWND hList;
     WCHAR currentPath[MAX_PATH];
+    std::vector<FileInfo> allFileData;
     std::vector<FileInfo> fileData;
     int sortColumn;
     bool sortAscending;
     std::wstring searchString;
     UINT_PTR searchTimerId;
     bool bProgrammaticPathChange;
+};
+
+struct FolderSizeParam {
+    HWND hNotifyWnd;
+    std::wstring folderPath;
+};
+
+struct FolderSizeResult {
+    std::wstring folderPath;
+    ULONGLONG size;
+    bool success;
 };
 
 WCHAR szClassName[] = L"fai";
@@ -114,13 +137,13 @@ void AddNewTab(HWND hWnd, LPCWSTR initialPath);
 void CloseTab(HWND hWnd, int index);
 LRESULT CALLBACK PathEditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
 LRESULT CALLBACK ListSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
-void ListDirectory(ExplorerTabData* pData);
+void ListDirectory(HWND hWnd, ExplorerTabData* pData);
 void UpdateSortMark(ExplorerTabData* pData);
 void UpdateTabTitle(ExplorerTabData* pData);
 void UpdateCaptionButtonsRect(HWND hWnd);
 void DrawCaptionButtons(HDC hdc, HWND hWnd);
 void FileTimeToString(const FILETIME& ft, WCHAR* buf, size_t bufSize);
-
+void ApplyAddressBarFilter(ExplorerTabData* pData);
 
 ExplorerTabData* GetCurrentTabData() {
     int sel = TabCtrl_GetCurSel(hTab);
@@ -198,8 +221,24 @@ bool CompareFunction(const FileInfo& a, const FileInfo& b, ExplorerTabData* pDat
         break;
     case 1:
     {
-        ULARGE_INTEGER sizeA = { a.findData.nFileSizeLow, a.findData.nFileSizeHigh };
-        ULARGE_INTEGER sizeB = { b.findData.nFileSizeLow, b.findData.nFileSizeHigh };
+        ULARGE_INTEGER sizeA, sizeB;
+
+        if (isDirA) {
+            sizeA.QuadPart = a.calculatedSize;
+        }
+        else {
+            sizeA.LowPart = a.findData.nFileSizeLow;
+            sizeA.HighPart = a.findData.nFileSizeHigh;
+        }
+
+        if (isDirB) {
+            sizeB.QuadPart = b.calculatedSize;
+        }
+        else {
+            sizeB.LowPart = b.findData.nFileSizeLow;
+            sizeB.HighPart = b.findData.nFileSizeHigh;
+        }
+
         if (sizeA.QuadPart < sizeB.QuadPart) result = -1;
         else if (sizeA.QuadPart > sizeB.QuadPart) result = 1;
         else result = 0;
@@ -218,13 +257,58 @@ bool CompareFunction(const FileInfo& a, const FileInfo& b, ExplorerTabData* pDat
     return pData->sortAscending ? (result < 0) : (result > 0);
 }
 
-void ListDirectory(ExplorerTabData* pData) {
-    pData->fileData.clear();
+ULONGLONG GetFolderSize(const std::wstring& folderPath) {
+    ULONGLONG totalSize = 0;
+    WIN32_FIND_DATAW fd;
+    std::wstring searchPath = folderPath + L"\\*";
+    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+
+    if (hFind == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+
+    do {
+        if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
+            std::wstring fullPath = folderPath + L"\\" + fd.cFileName;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                totalSize += GetFolderSize(fullPath);
+            }
+            else {
+                ULARGE_INTEGER fileSize;
+                fileSize.LowPart = fd.nFileSizeLow;
+                fileSize.HighPart = fd.nFileSizeHigh;
+                totalSize += fileSize.QuadPart;
+            }
+        }
+    } while (FindNextFileW(hFind, &fd));
+
+    FindClose(hFind);
+    return totalSize;
+}
+
+DWORD WINAPI CalculateFolderSizeThread(LPVOID lpParam) {
+    auto* param = static_cast<FolderSizeParam*>(lpParam);
+    if (!param) {
+        return 1;
+    }
+
+    ULONGLONG size = GetFolderSize(param->folderPath);
+
+    auto* result = new FolderSizeResult{ param->folderPath, size, true };
+
+    PostMessage(param->hNotifyWnd, WM_APP_FOLDER_SIZE_CALCULATED, 0, (LPARAM)result);
+
+    delete param;
+    return 0;
+}
+
+void ListDirectory(HWND hWnd, ExplorerTabData* pData) {
+    pData->allFileData.clear();
     if (PathIsRootW(pData->currentPath) == FALSE) {
         FileInfo up_info = { 0 };
         up_info.findData.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
         StringCchCopyW(up_info.findData.cFileName, MAX_PATH, L"..");
-        pData->fileData.push_back(up_info);
+        pData->allFileData.push_back(up_info);
     }
     WIN32_FIND_DATAW fd;
     WCHAR searchPath[MAX_PATH];
@@ -233,21 +317,44 @@ void ListDirectory(ExplorerTabData* pData) {
     if (hFind != INVALID_HANDLE_VALUE) {
         do {
             if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
-                FileInfo info;
+                FileInfo info = { 0 };
                 info.findData = fd;
 
                 WCHAR fullPath[MAX_PATH];
                 PathCombineW(fullPath, pData->currentPath, fd.cFileName);
                 info.owner = GetFileOwnerW(fullPath);
 
-                pData->fileData.push_back(info);
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                    info.sizeState = SizeCalculationState::NotStarted;
+                    info.calculatedSize = 0;
+                }
+
+                pData->allFileData.push_back(info);
             }
         } while (FindNextFileW(hFind, &fd));
         FindClose(hFind);
     }
-    std::sort(pData->fileData.begin(), pData->fileData.end(), [&](const FileInfo& a, const FileInfo& b) {
+
+    std::sort(pData->allFileData.begin(), pData->allFileData.end(), [&](const FileInfo& a, const FileInfo& b) {
         return CompareFunction(a, b, pData);
         });
+
+    for (auto& item : pData->allFileData) {
+        if ((item.findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && wcscmp(item.findData.cFileName, L"..") != 0) {
+            item.sizeState = SizeCalculationState::InProgress;
+
+            auto* param = new FolderSizeParam;
+            param->hNotifyWnd = hWnd;
+            WCHAR fullPath[MAX_PATH];
+            PathCombineW(fullPath, pData->currentPath, item.findData.cFileName);
+            param->folderPath = fullPath;
+
+            CreateThread(NULL, 0, CalculateFolderSizeThread, param, 0, NULL);
+        }
+    }
+
+    pData->fileData = pData->allFileData;
+
     ListView_SetItemCountEx(pData->hList, pData->fileData.size(), LVSICF_NOINVALIDATEALL);
     InvalidateRect(pData->hList, NULL, TRUE);
 }
@@ -355,7 +462,6 @@ void DoCopyCut(HWND hWnd, bool isCut) {
             }
         }
 
-
         if (isCut) {
             HGLOBAL hEffect = GlobalAlloc(GHND | GMEM_SHARE, sizeof(DWORD));
             if (hEffect) {
@@ -425,7 +531,7 @@ void DoPaste(HWND hWnd) {
     else {
         CloseClipboard();
     }
-    ListDirectory(pData);
+    ListDirectory(hWnd, pData);
 }
 
 void DoDelete(HWND hWnd, bool permanent) {
@@ -451,7 +557,7 @@ void DoDelete(HWND hWnd, bool permanent) {
     sfo.pFrom = fromPaths.data();
     sfo.fFlags = permanent ? 0 : FOF_ALLOWUNDO;
     SHFileOperationW(&sfo);
-    ListDirectory(pData);
+    ListDirectory(hWnd, pData);
 }
 
 void UpdateSortMark(ExplorerTabData* pData) {
@@ -520,7 +626,7 @@ void ShowContextMenu(HWND hWnd, ExplorerTabData* pData, int iItem, POINT pt) {
                     cmi.lpVerb = MAKEINTRESOURCEA(idCmd - 1);
                     cmi.nShow = SW_SHOWNORMAL;
                     pContextMenu->InvokeCommand(&cmi);
-                    ListDirectory(pData);
+                    ListDirectory(hWnd, pData);
                 }
             }
             DestroyMenu(hMenu);
@@ -548,7 +654,7 @@ void NavigateUpAndSelect(HWND hWnd) {
 
         SetWindowTextW(hPathEdit, pData->currentPath);
         ListView_SetItemState(pData->hList, -1, 0, LVIS_SELECTED);
-        ListDirectory(pData);
+        ListDirectory(hWnd, pData);
         UpdateSortMark(pData);
         for (size_t i = 0; i < pData->fileData.size(); ++i) {
             if (wcscmp(pData->fileData[i].findData.cFileName, previousFolderName) == 0) {
@@ -579,7 +685,7 @@ void NavigateToSelected(ExplorerTabData* pData) {
 
         SetWindowTextW(hPathEdit, pData->currentPath);
         ListView_SetItemState(pData->hList, -1, 0, LVIS_SELECTED);
-        ListDirectory(pData);
+        ListDirectory(GetParent(pData->hList), pData);
         UpdateSortMark(pData);
         if (ListView_GetItemCount(pData->hList) > 0) {
             ListView_SetItemState(pData->hList, 0, LVIS_FOCUSED | LVIS_SELECTED, LVIS_FOCUSED | LVIS_SELECTED);
@@ -631,7 +737,7 @@ LRESULT CALLBACK PathEditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
             GetWindowTextW(hWnd, buffer, MAX_PATH);
 
             WCHAR resolvedPath[MAX_PATH];
-            // 入力されたパスが相対パスの場合、現在のパスと結合する
+
             if (PathIsRelativeW(buffer)) {
                 PathCchCombine(resolvedPath, MAX_PATH, pData->currentPath, buffer);
             }
@@ -639,39 +745,45 @@ LRESULT CALLBACK PathEditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
                 StringCchCopyW(resolvedPath, MAX_PATH, buffer);
             }
 
-            // 解決後のパスがディレクトリかチェック
             if (PathIsDirectoryW(resolvedPath)) {
                 PathCchCanonicalize(pData->currentPath, MAX_PATH, resolvedPath);
                 UpdateTabTitle(pData);
+
+                pData->bProgrammaticPathChange = true;
                 SetWindowTextW(hWnd, pData->currentPath);
-                ListDirectory(pData);
+                pData->bProgrammaticPathChange = false;
+
+                ListDirectory(GetParent(hWnd), pData);
                 UpdateSortMark(pData);
                 SetFocus(pData->hList);
             }
             else {
-                // ディレクトリでなければファイル実行を試みる
                 SHELLEXECUTEINFOW sei = { sizeof(sei) };
                 sei.fMask = SEE_MASK_NOCLOSEPROCESS;
                 sei.hwnd = GetParent(hWnd);
                 sei.lpVerb = L"open";
-                sei.lpFile = buffer; // 実行時は元の入力を維持
+                sei.lpFile = buffer;
                 sei.lpDirectory = pData->currentPath;
                 sei.nShow = SW_SHOWNORMAL;
                 ShellExecuteExW(&sei);
 
-                // 実行後、アドレスバーのテキストを元のパスに戻す
                 pData->bProgrammaticPathChange = true;
                 SetWindowTextW(hWnd, pData->currentPath);
                 pData->bProgrammaticPathChange = false;
                 SendMessageW(hWnd, EM_SETSEL, (WPARAM)-1, 0);
+
+                ApplyAddressBarFilter(pData);
             }
             return 0;
         }
         else if (wParam == VK_ESCAPE)
         {
-            // テキストを現在のフォルダパスに戻す
+            pData->bProgrammaticPathChange = true;
             SetWindowTextW(hWnd, pData->currentPath);
-            // テキストをすべて選択状態にする
+            pData->bProgrammaticPathChange = false;
+
+            ApplyAddressBarFilter(pData);
+
             SendMessageW(hWnd, EM_SETSEL, 0, -1);
             return 0;
         }
@@ -686,6 +798,16 @@ LRESULT CALLBACK PathEditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
             return 0;
         }
         break;
+    case WM_KILLFOCUS:
+    {
+        if (GetWindowTextLengthW(hWnd) == 0)
+        {
+            pData->bProgrammaticPathChange = true;
+            SetWindowTextW(hWnd, pData->currentPath);
+            pData->bProgrammaticPathChange = false;
+        }
+        break;
+    }
     case WM_NCDESTROY:
         RemoveWindowSubclass(hWnd, PathEditSubclassProc, uIdSubclass);
         break;
@@ -813,7 +935,6 @@ LRESULT CALLBACK TabSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             TCHITTESTINFO hti = { 0 };
             hti.pt = pt;
 
-            // Y座標をタブの中央に固定し、X軸だけでヒットテストを行う
             if (TabCtrl_GetItemCount(hWnd) > 0) {
                 RECT rcFirstTab;
                 TabCtrl_GetItemRect(hWnd, 0, &rcFirstTab);
@@ -895,7 +1016,6 @@ LRESULT CALLBACK TabSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
             TCHITTESTINFO hti = { 0 };
             hti.pt = pt;
 
-            // Y座標をタブの中央に固定し、X軸だけでヒットテストを行う
             if (TabCtrl_GetItemCount(hWnd) > 0) {
                 RECT rcFirstTab;
                 TabCtrl_GetItemRect(hWnd, 0, &rcFirstTab);
@@ -1009,7 +1129,7 @@ void PerformIncrementalSearch(ExplorerTabData* pData) {
     for (int i = 0; i <= startIndex; ++i) {
         if (StrCmpNIW(pData->fileData[i].findData.cFileName, pData->searchString.c_str(), pData->searchString.length()) == 0) {
             ListView_SetItemState(pData->hList, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
-            ListView_SetItemState(pData->hList, i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_SetItemState(pData->hList, i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_SELECTED);
             ListView_EnsureVisible(pData->hList, i, FALSE);
             return;
         }
@@ -1062,24 +1182,88 @@ LRESULT CALLBACK ListSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lP
     return DefSubclassProc(hWnd, uMsg, wParam, lParam);
 }
 
+void ApplyAddressBarFilter(ExplorerTabData* pData) {
+    WCHAR filterText[MAX_PATH];
+    GetWindowTextW(hPathEdit, filterText, MAX_PATH);
 
-// [修正] マウスメッセージの処理を全面的に見直したウィンドウプロシージャ
+    if (wcslen(filterText) > 0 && (wcschr(filterText, L'\\') || wcschr(filterText, L'/') || wcschr(filterText, L':'))) {
+        if (pData->fileData.size() != pData->allFileData.size()) {
+            pData->fileData = pData->allFileData;
+            ListView_SetItemCountEx(pData->hList, pData->fileData.size(), LVSICF_NOINVALIDATEALL);
+            InvalidateRect(pData->hList, NULL, TRUE);
+        }
+        return;
+    }
+
+    if (wcslen(filterText) == 0) {
+        if (pData->fileData.size() != pData->allFileData.size()) {
+            pData->fileData = pData->allFileData;
+            ListView_SetItemCountEx(pData->hList, pData->fileData.size(), LVSICF_NOINVALIDATEALL);
+            InvalidateRect(pData->hList, NULL, TRUE);
+        }
+        return;
+    }
+
+    pData->fileData.clear();
+    for (const auto& fileInfo : pData->allFileData) {
+        if (StrStrIW(fileInfo.findData.cFileName, filterText)) {
+            pData->fileData.push_back(fileInfo);
+        }
+    }
+
+    ListView_SetItemCountEx(pData->hList, pData->fileData.size(), LVSICF_NOINVALIDATEALL);
+    InvalidateRect(pData->hList, NULL, TRUE);
+}
+
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+    case WM_APP_FOLDER_SIZE_CALCULATED:
+    {
+        auto* result = reinterpret_cast<FolderSizeResult*>(lParam);
+        if (result) {
+            ExplorerTabData* pData = GetCurrentTabData();
+            // [今回の修正] 現在のタブのフォルダパスと比較して、古い結果を無視するように修正
+            if (pData && PathIsPrefixW(pData->currentPath, result->folderPath.c_str())) {
+
+                // マスターリスト(allFileData)を更新
+                for (auto& item : pData->allFileData) {
+                    WCHAR fullPath[MAX_PATH];
+                    PathCombineW(fullPath, pData->currentPath, item.findData.cFileName);
+                    if (result->folderPath == fullPath) {
+                        item.calculatedSize = result->size;
+                        item.sizeState = result->success ? SizeCalculationState::Completed : SizeCalculationState::Error;
+                        break;
+                    }
+                }
+
+                // 表示用リスト(fileData)を更新して再描画
+                for (int i = 0; i < (int)pData->fileData.size(); ++i) {
+                    WCHAR fullPath[MAX_PATH];
+                    PathCombineW(fullPath, pData->currentPath, pData->fileData[i].findData.cFileName);
+                    if (result->folderPath == fullPath) {
+                        pData->fileData[i].calculatedSize = result->size;
+                        pData->fileData[i].sizeState = result->success ? SizeCalculationState::Completed : SizeCalculationState::Error;
+                        ListView_RedrawItems(pData->hList, i, i);
+                        break;
+                    }
+                }
+            }
+            delete result;
+        }
+        return 0;
+    }
     case WM_NCACTIVATE:
         return 1;
     case WM_NCPAINT:
         return 0;
     case WM_NCCALCSIZE:
         return 0;
-        // [修正] ボタン領域をHTCLIENTとして返し、WM_MOUSEMOVEを受け取れるようにする
     case WM_NCHITTEST:
     {
         POINT ptScreen = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         POINT ptClient = ptScreen;
         ScreenToClient(hWnd, &ptClient);
 
-        // ボタン上ならHTCLIENTを返し、WM_MOUSEMOVEやWM_LBUTTONDOWNを発生させる
         if (PtInRect(&g_rcMinButton, ptClient) ||
             PtInRect(&g_rcMaxButton, ptClient) ||
             PtInRect(&g_rcCloseButton, ptClient)) {
@@ -1120,9 +1304,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return HTCLIENT;
     }
-    // [削除] WM_NCLBUTTONDOWN / WM_NCLBUTTONUP は使わなくなるので削除
-
-    // [追加] WM_LBUTTONDOWNでマウスキャプチャーを開始
     case WM_LBUTTONDOWN:
     {
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
@@ -1136,11 +1317,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_pressedButton = pressed;
             SetCapture(hWnd);
             InvalidateRect(hWnd, NULL, FALSE);
-            return 0; // Handled
+            return 0;
         }
         return DefWindowProc(hWnd, msg, wParam, lParam);
     }
-    // [追加] WM_LBUTTONUPでマウスキャプチャーを終了し、ボタンのアクションを実行
     case WM_LBUTTONUP:
     {
         if (g_pressedButton != CaptionButtonState::None) {
@@ -1166,7 +1346,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return DefWindowProc(hWnd, msg, wParam, lParam);
     }
-    // [追加] 予期せずマウスキャプチャーが失われた場合の状態リセット
     case WM_CAPTURECHANGED:
     {
         if ((HWND)lParam != hWnd) {
@@ -1210,7 +1389,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         UpdateCaptionButtonsRect(hWnd);
     }
     break;
-
     case WM_MOUSEMOVE:
     {
         if (!g_isTrackingMouse) {
@@ -1237,8 +1415,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
     }
     break;
-
-    // [修正] WM_MOUSELEAVEのロジックを簡潔化
     case WM_MOUSELEAVE:
     {
         g_isTrackingMouse = false;
@@ -1251,7 +1427,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
     }
     break;
-
     case WM_PAINT:
     {
         PAINTSTRUCT ps;
@@ -1269,9 +1444,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         EndPaint(hWnd, &ps);
         return 0;
     }
-
-    // ... 以降の WM_DRAWITEM から default までの処理は変更ありません ...
-    // ... (元のコードをそのまま使用してください) ...
     case WM_DRAWITEM:
     {
         LPDRAWITEMSTRUCT lpdis = (LPDRAWITEMSTRUCT)lParam;
@@ -1353,13 +1525,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             DrawTextW(hdc, szText, -1, &rcText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
             if (iItem == g_hoveredCloseButtonTab) {
-                HBRUSH hCloseBrush = CreateSolidBrush(RGB(232, 17, 35)); // 赤
+                HBRUSH hCloseBrush = CreateSolidBrush(RGB(232, 17, 35));
                 FillRect(hdc, &rcClose, hCloseBrush);
                 DeleteObject(hCloseBrush);
-                SetTextColor(hdc, RGB(255, 255, 255)); // 白
+                SetTextColor(hdc, RGB(255, 255, 255));
             }
             else {
-                SetTextColor(hdc, RGB(100, 100, 100)); // グレー
+                SetTextColor(hdc, RGB(100, 100, 100));
             }
             DrawTextW(hdc, L"✕", -1, &rcClose, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 
@@ -1367,7 +1539,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
     }
     break;
-
     case WM_TIMER:
     {
         if (wParam == SEARCH_TIMER_ID) {
@@ -1378,9 +1549,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 pData->searchString.clear();
             }
         }
+        else if (wParam == FILTER_TIMER_ID) {
+            KillTimer(hWnd, FILTER_TIMER_ID);
+            ExplorerTabData* pData = GetCurrentTabData();
+            if (pData) {
+                ApplyAddressBarFilter(pData);
+            }
+        }
     }
     break;
-
     case WM_ACTIVATE:
     {
         if (LOWORD(wParam) != WA_INACTIVE) {
@@ -1390,14 +1567,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         InvalidateRect(hWnd, NULL, TRUE);
     }
     break;
-
     case WM_SIZE:
         UpdateCaptionButtonsRect(hWnd);
         UpdateLayout(hWnd);
         break;
-
     case WM_COMMAND:
     {
+        if (HIWORD(wParam) == EN_CHANGE && (HWND)lParam == hPathEdit) {
+            ExplorerTabData* pData = GetCurrentTabData();
+            if (pData && !pData->bProgrammaticPathChange) {
+                SetTimer(hWnd, FILTER_TIMER_ID, 200, nullptr);
+            }
+            return 0;
+        }
+
         ExplorerTabData* pData = GetCurrentTabData();
         if (!pData && LOWORD(wParam) != IDC_ADD_TAB_BUTTON) break;
 
@@ -1433,7 +1616,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         break;
         case ID_ACCELERATOR_REFRESH:
-            ListDirectory(pData);
+            ListDirectory(hWnd, pData);
             UpdateSortMark(pData);
             break;
         case ID_ACCELERATOR_NEW_TAB:
@@ -1465,7 +1648,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
     }
     break;
-
     case WM_NOTIFY:
     {
         LPNMHDR lpnmh = (LPNMHDR)lParam;
@@ -1490,7 +1672,23 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         case 0: StringCchCopy(pItem->pszText, pItem->cchTextMax, fd.cFileName); break;
                         case 1:
                             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                                StringCchCopy(pItem->pszText, pItem->cchTextMax, L"");
+                                if (wcscmp(fd.cFileName, L"..") == 0) {
+                                    StringCchCopy(pItem->pszText, pItem->cchTextMax, L"");
+                                }
+                                else {
+                                    switch (info.sizeState) {
+                                    case SizeCalculationState::InProgress:
+                                    case SizeCalculationState::NotStarted:
+                                        StringCchCopy(pItem->pszText, pItem->cchTextMax, L"計測中...");
+                                        break;
+                                    case SizeCalculationState::Completed:
+                                        StrFormatByteSizeW(info.calculatedSize, pItem->pszText, pItem->cchTextMax);
+                                        break;
+                                    case SizeCalculationState::Error:
+                                        StringCchCopy(pItem->pszText, pItem->cchTextMax, L"アクセス不可");
+                                        break;
+                                    }
+                                }
                             }
                             else {
                                 ULARGE_INTEGER sz = { fd.nFileSizeLow, fd.nFileSizeHigh };
@@ -1532,10 +1730,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         pData->sortColumn = clickedColumn;
                         pData->sortAscending = true;
                     }
-                    std::sort(pData->fileData.begin(), pData->fileData.end(), [&](const FileInfo& a, const FileInfo& b) {
+
+                    // マスターリストと表示用リストの両方をソートします
+                    auto sort_predicate = [&](const FileInfo& a, const FileInfo& b) {
                         return CompareFunction(a, b, pData);
-                        });
+                        };
+                    std::sort(pData->allFileData.begin(), pData->allFileData.end(), sort_predicate);
+                    std::sort(pData->fileData.begin(), pData->fileData.end(), sort_predicate);
+
+                    // ソートマーク（▲▼）を更新します
                     UpdateSortMark(pData);
+
+                    // リストビューを再描画して変更を反映させます
                     InvalidateRect(pData->hList, NULL, TRUE);
                 }
                 break;
@@ -1608,7 +1814,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
     }
     break;
-
     case WM_DESTROY:
         for (const auto& tab : g_tabs) {
             if (tab->searchTimerId) KillTimer(hWnd, tab->searchTimerId);
@@ -1617,7 +1822,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         DeleteObject((HGDIOBJ)SendMessage(hAddButton, WM_GETFONT, 0, 0));
         PostQuitMessage(0);
         break;
-
     default:
         return DefWindowProc(hWnd, msg, wParam, lParam);
     }
@@ -1657,7 +1861,7 @@ void AddNewTab(HWND hWnd, LPCWSTR initialPath) {
     lvc.fmt = LVCFMT_LEFT; lvc.cx = 150; lvc.pszText = (LPWSTR)L"作成日時"; ListView_InsertColumn(pData->hList, 3, &lvc);
     lvc.fmt = LVCFMT_LEFT; lvc.cx = 150; lvc.pszText = (LPWSTR)L"所有者"; ListView_InsertColumn(pData->hList, 4, &lvc);
 
-    ListDirectory(pData.get());
+    ListDirectory(hWnd, pData.get());
     UpdateSortMark(pData.get());
 
     TCITEMW tci = { TCIF_TEXT };
@@ -1699,8 +1903,11 @@ void SwitchTab(HWND hWnd, int newIndex) {
         ShowWindow(g_tabs[i]->hList, show ? SW_SHOW : SW_HIDE);
     }
     if (newIndex >= 0 && newIndex < (int)g_tabs.size()) {
-        SetWindowTextW(hPathEdit, g_tabs[newIndex]->currentPath);
-        SetFocus(g_tabs[newIndex]->hList);
+        ExplorerTabData* pData = g_tabs[newIndex].get();
+        pData->bProgrammaticPathChange = true;
+        SetWindowTextW(hPathEdit, pData->currentPath);
+        pData->bProgrammaticPathChange = false;
+        SetFocus(pData->hList);
     }
     UpdateLayout(hWnd);
 }
@@ -1711,51 +1918,44 @@ void UpdateLayout(HWND hWnd) {
 
     constexpr int TITLEBAR_HEIGHT = 32;
 
-    // タイトルバー内のコントロールの定数
     constexpr int PATH_EDIT_WIDTH = 250;
     constexpr int PATH_EDIT_MARGIN = 4;
     constexpr int ADD_BUTTON_WIDTH = 22;
     constexpr int ADD_BUTTON_MARGIN = 4;
 
-    int tabHeight = 30;
-    int tabY = (TITLEBAR_HEIGHT - tabHeight) / 2;
+    RECT rcAdjust = { 0, 0, 0, 0 };
+    TabCtrl_AdjustRect(hTab, TRUE, &rcAdjust);
+    int tabHeight = -rcAdjust.top;
+
+    int tabY = TITLEBAR_HEIGHT - tabHeight;
 
     int pathEditHeight = 24;
     int pathEditY = (TITLEBAR_HEIGHT - pathEditHeight) / 2;
-
     int addButtonY = (TITLEBAR_HEIGHT - ADD_BUTTON_WIDTH) / 2;
 
-    // キャプションボタンの左端を右側の境界とする
     int rightBoundary = g_rcMinButton.left;
 
-    // 右から順にコントロールを配置
     int pathEditX = rightBoundary - PATH_EDIT_MARGIN - PATH_EDIT_WIDTH;
     int addButtonX = pathEditX - ADD_BUTTON_MARGIN - ADD_BUTTON_WIDTH;
 
-    // 残りのスペースをタブコントロールが使用する
     int tabWidth = addButtonX;
 
-    // ウィンドウが非常に小さい場合の sanity check
     if (pathEditX < 0) pathEditX = 0;
     if (addButtonX < 0) addButtonX = 0;
     if (tabWidth < 0) tabWidth = 0;
 
-    // 各コントロールを移動
     MoveWindow(hTab, 0, tabY, tabWidth, tabHeight, TRUE);
     MoveWindow(hAddButton, addButtonX, addButtonY, ADD_BUTTON_WIDTH, ADD_BUTTON_WIDTH, TRUE);
     MoveWindow(hPathEdit, pathEditX, pathEditY, PATH_EDIT_WIDTH, pathEditHeight, TRUE);
 
-    // Zオーダーを調整して、コントロールが最前面に来るようにする
     SetWindowPos(hAddButton, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     SetWindowPos(hPathEdit, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
 
-    // コンテンツ領域（ListView）を配置
     int curSel = TabCtrl_GetCurSel(hTab);
     if (curSel != -1) {
         ExplorerTabData* pData = GetCurrentTabData();
         if (pData) {
             int contentTop = TITLEBAR_HEIGHT;
-            // ListViewはタイトルバーのすぐ下から開始する
             MoveWindow(pData->hList, 0, contentTop, rcClient.right, rcClient.bottom - contentTop, TRUE);
             UpdateWindow(pData->hList);
         }
@@ -1792,24 +1992,20 @@ void DrawCaptionButtons(HDC hdc, HWND hWnd) {
         int iState;
         BOOL bActive = (GetActiveWindow() == hWnd);
 
-        // --- 最小化ボタン ---
         iState = MINBS_NORMAL;
         if (!bActive) {
             iState = MINBS_INACTIVE;
         }
         else {
-            // ボタンが押されており、かつマウスが上にある場合のみ PUSHED 状態
             if (g_pressedButton == CaptionButtonState::Min && g_hoveredButton == CaptionButtonState::Min) {
                 iState = MINBS_PUSHED;
             }
-            // マウスが上にある場合は HOT 状態
             else if (g_hoveredButton == CaptionButtonState::Min) {
                 iState = MINBS_HOT;
             }
         }
         DrawThemeBackground(hTheme, hdc, WP_MINBUTTON, iState, &g_rcMinButton, NULL);
 
-        // --- 最大化/元に戻すボタン ---
         if (IsZoomed(hWnd)) {
             iState = RBS_NORMAL;
             if (!bActive) {
@@ -1841,7 +2037,6 @@ void DrawCaptionButtons(HDC hdc, HWND hWnd) {
             DrawThemeBackground(hTheme, hdc, WP_MAXBUTTON, iState, &g_rcMaxButton, NULL);
         }
 
-        // --- 閉じるボタン ---
         iState = CBS_NORMAL;
         if (!bActive) {
             iState = CBS_INACTIVE;
