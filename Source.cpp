@@ -1062,6 +1062,8 @@ LRESULT CALLBACK ListSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lP
     return DefSubclassProc(hWnd, uMsg, wParam, lParam);
 }
 
+
+// [修正] マウスメッセージの処理を全面的に見直したウィンドウプロシージャ
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_NCACTIVATE:
@@ -1070,32 +1072,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_NCCALCSIZE:
         return 0;
+        // [修正] ボタン領域をHTCLIENTとして返し、WM_MOUSEMOVEを受け取れるようにする
     case WM_NCHITTEST:
     {
         POINT ptScreen = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         POINT ptClient = ptScreen;
         ScreenToClient(hWnd, &ptClient);
 
-        if (PtInRect(&g_rcMinButton, ptClient)) {
-            if (g_pressedButton != CaptionButtonState::None && g_pressedButton != CaptionButtonState::Min) {
-                g_pressedButton = CaptionButtonState::None;
-                InvalidateRect(hWnd, NULL, TRUE);
-            }
-            return HTMINBUTTON;
-        }
-        if (PtInRect(&g_rcMaxButton, ptClient)) {
-            if (g_pressedButton != CaptionButtonState::None && g_pressedButton != CaptionButtonState::Max) {
-                g_pressedButton = CaptionButtonState::None;
-                InvalidateRect(hWnd, NULL, TRUE);
-            }
-            return HTMAXBUTTON;
-        }
-        if (PtInRect(&g_rcCloseButton, ptClient)) {
-            if (g_pressedButton != CaptionButtonState::None && g_pressedButton != CaptionButtonState::Close) {
-                g_pressedButton = CaptionButtonState::None;
-                InvalidateRect(hWnd, NULL, TRUE);
-            }
-            return HTCLOSE;
+        // ボタン上ならHTCLIENTを返し、WM_MOUSEMOVEやWM_LBUTTONDOWNを発生させる
+        if (PtInRect(&g_rcMinButton, ptClient) ||
+            PtInRect(&g_rcMaxButton, ptClient) ||
+            PtInRect(&g_rcCloseButton, ptClient)) {
+            return HTCLIENT;
         }
 
         LRESULT result;
@@ -1132,46 +1120,61 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return HTCLIENT;
     }
-    case WM_NCLBUTTONDOWN:
+    // [削除] WM_NCLBUTTONDOWN / WM_NCLBUTTONUP は使わなくなるので削除
+
+    // [追加] WM_LBUTTONDOWNでマウスキャプチャーを開始
+    case WM_LBUTTONDOWN:
     {
-        g_pressedButton = CaptionButtonState::None;
-        switch (wParam) {
-        case HTMINBUTTON:
-            g_pressedButton = CaptionButtonState::Min;
-            break;
-        case HTMAXBUTTON:
-            g_pressedButton = CaptionButtonState::Max;
-            break;
-        case HTCLOSE:
-            g_pressedButton = CaptionButtonState::Close;
-            break;
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        CaptionButtonState pressed = CaptionButtonState::None;
+
+        if (PtInRect(&g_rcMinButton, pt)) pressed = CaptionButtonState::Min;
+        else if (PtInRect(&g_rcMaxButton, pt)) pressed = CaptionButtonState::Max;
+        else if (PtInRect(&g_rcCloseButton, pt)) pressed = CaptionButtonState::Close;
+
+        if (pressed != CaptionButtonState::None) {
+            g_pressedButton = pressed;
+            SetCapture(hWnd);
+            InvalidateRect(hWnd, NULL, FALSE);
+            return 0; // Handled
         }
+        return DefWindowProc(hWnd, msg, wParam, lParam);
+    }
+    // [追加] WM_LBUTTONUPでマウスキャプチャーを終了し、ボタンのアクションを実行
+    case WM_LBUTTONUP:
+    {
         if (g_pressedButton != CaptionButtonState::None) {
-            InvalidateRect(hWnd, NULL, TRUE);
+            CaptionButtonState pressedButton = g_pressedButton;
+            g_pressedButton = CaptionButtonState::None;
+            ReleaseCapture();
+
+            if (g_hoveredButton == pressedButton) {
+                switch (pressedButton) {
+                case CaptionButtonState::Min:
+                    PostMessage(hWnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+                    break;
+                case CaptionButtonState::Max:
+                    PostMessage(hWnd, WM_SYSCOMMAND, IsZoomed(hWnd) ? SC_RESTORE : SC_MAXIMIZE, 0);
+                    break;
+                case CaptionButtonState::Close:
+                    PostMessage(hWnd, WM_SYSCOMMAND, SC_CLOSE, 0);
+                    break;
+                }
+            }
+            InvalidateRect(hWnd, NULL, FALSE);
             return 0;
         }
         return DefWindowProc(hWnd, msg, wParam, lParam);
     }
-    case WM_NCLBUTTONUP:
+    // [追加] 予期せずマウスキャプチャーが失われた場合の状態リセット
+    case WM_CAPTURECHANGED:
     {
-        if (g_pressedButton != CaptionButtonState::None) {
+        if ((HWND)lParam != hWnd) {
             g_pressedButton = CaptionButtonState::None;
             InvalidateRect(hWnd, NULL, TRUE);
         }
-        switch (wParam) {
-        case HTMINBUTTON:
-            SendMessage(hWnd, WM_SYSCOMMAND, SC_MINIMIZE, lParam);
-            return 0;
-        case HTMAXBUTTON:
-            SendMessage(hWnd, WM_SYSCOMMAND, IsZoomed(hWnd) ? SC_RESTORE : SC_MAXIMIZE, lParam);
-            return 0;
-        case HTCLOSE:
-            SendMessage(hWnd, WM_SYSCOMMAND, SC_CLOSE, lParam);
-            return 0;
-        }
-        return DefWindowProc(hWnd, msg, wParam, lParam);
+        return 0;
     }
-
     case WM_CREATE:
     {
         hFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, 0, L"Segoe UI");
@@ -1192,7 +1195,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SetWindowSubclass(hPathEdit, PathEditSubclassProc, 0, 0);
         SHAutoComplete(hPathEdit, SHACF_FILESYS_DIRS | SHACF_AUTOSUGGEST_FORCE_ON | SHACF_AUTOAPPEND_FORCE_ON);
 
-        // AddButtonのフォントを少し大きくする
         LOGFONTW lf = { 0 };
         GetObject(hFont, sizeof(lf), &lf);
         lf.lfHeight = 22;
@@ -1219,16 +1221,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_isTrackingMouse = true;
             }
         }
-        if (g_pressedButton != CaptionButtonState::None && GetAsyncKeyState(VK_LBUTTON) == 0) {
-            g_pressedButton = CaptionButtonState::None;
-            InvalidateRect(hWnd, NULL, TRUE);
-        }
+
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         CaptionButtonState oldHovered = g_hoveredButton;
         g_hoveredButton = CaptionButtonState::None;
         if (PtInRect(&g_rcMinButton, pt)) g_hoveredButton = CaptionButtonState::Min;
         else if (PtInRect(&g_rcMaxButton, pt)) g_hoveredButton = CaptionButtonState::Max;
         else if (PtInRect(&g_rcCloseButton, pt)) g_hoveredButton = CaptionButtonState::Close;
+
         if (oldHovered != g_hoveredButton) {
             RECT redrawRect = g_rcMinButton;
             UnionRect(&redrawRect, &redrawRect, &g_rcMaxButton);
@@ -1238,12 +1238,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     break;
 
+    // [修正] WM_MOUSELEAVEのロジックを簡潔化
     case WM_MOUSELEAVE:
     {
         g_isTrackingMouse = false;
-        if (g_hoveredButton != CaptionButtonState::None || g_pressedButton != CaptionButtonState::None) {
+        if (g_hoveredButton != CaptionButtonState::None) {
             g_hoveredButton = CaptionButtonState::None;
-            g_pressedButton = CaptionButtonState::None;
             RECT redrawRect = g_rcMinButton;
             UnionRect(&redrawRect, &redrawRect, &g_rcMaxButton);
             UnionRect(&redrawRect, &redrawRect, &g_rcCloseButton);
@@ -1260,7 +1260,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         RECT rcClient;
         GetClientRect(hWnd, &rcClient);
 
-        // タイトルバー領域をフラットな背景色で塗りつぶす
         RECT rcTitleBar = { 0, 0, rcClient.right, 32 };
         HBRUSH hBrush = CreateSolidBrush(FLATUI_BACKGROUND);
         FillRect(hdc, &rcTitleBar, hBrush);
@@ -1271,6 +1270,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
 
+    // ... 以降の WM_DRAWITEM から default までの処理は変更ありません ...
+    // ... (元のコードをそのまま使用してください) ...
     case WM_DRAWITEM:
     {
         LPDRAWITEMSTRUCT lpdis = (LPDRAWITEMSTRUCT)lParam;
@@ -1278,12 +1279,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HDC hdc = lpdis->hDC;
             RECT rc = lpdis->rcItem;
 
-            // 背景を塗りつぶし
             HBRUSH hBrush = CreateSolidBrush(FLATUI_BACKGROUND);
             FillRect(hdc, &rc, hBrush);
             DeleteObject(hBrush);
 
-            // マウスの状態に応じて枠線を描画
             if (lpdis->itemState & ODS_HOTLIGHT) {
                 HBRUSH hFrameBrush = CreateSolidBrush(RGB(229, 243, 255));
                 FillRect(hdc, &rc, hFrameBrush);
@@ -1300,7 +1299,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 DeleteObject(hFrameBrush);
             }
 
-            // "+"を描画
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, FLATUI_TEXT);
             DrawTextW(hdc, L"+", -1, &rc, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
@@ -1312,16 +1310,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int iItem = lpdis->itemID;
             int iSel = TabCtrl_GetCurSel(hTab);
 
-            // 背景色を決定
             bool isSelected = (iItem == iSel);
             COLORREF bgColor = isSelected ? FLATUI_ACTIVE_TAB : FLATUI_BACKGROUND;
 
-            // 背景を塗りつぶし
             HBRUSH hBrush = CreateSolidBrush(bgColor);
             FillRect(hdc, &rcItem, hBrush);
             DeleteObject(hBrush);
 
-            // アクティブなタブの下にアクセントカラーの線を描画
             if (isSelected) {
                 RECT rcIndicator = { rcItem.left, rcItem.bottom - 2, rcItem.right, rcItem.bottom };
                 HBRUSH hAccentBrush = CreateSolidBrush(FLATUI_ACCENT);
@@ -1329,7 +1324,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 DeleteObject(hAccentBrush);
             }
 
-            // タブ間の区切り線を描画
             HPEN hPen = CreatePen(PS_SOLID, 1, FLATUI_SEPARATOR);
             HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
             MoveToEx(hdc, rcItem.right - 1, rcItem.top + 4, NULL);
@@ -1337,7 +1331,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SelectObject(hdc, hOldPen);
             DeleteObject(hPen);
 
-            // テキストを取得
             WCHAR szText[MAX_PATH];
             TCITEMW tci = { 0 };
             tci.mask = TCIF_TEXT;
@@ -1345,7 +1338,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             tci.cchTextMax = ARRAYSIZE(szText);
             TabCtrl_GetItem(hTab, iItem, &tci);
 
-            // テキストと閉じるボタンの描画領域を計算
             RECT rcClose = rcItem;
             rcClose.left = rcItem.right - 22;
             rcClose.right = rcItem.right - 2;
@@ -1356,12 +1348,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             rcText.right = rcClose.left;
             rcText.left += 8;
 
-            // テキストを描画
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, FLATUI_TEXT);
             DrawTextW(hdc, szText, -1, &rcText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-            // 閉じるボタンを描画
             if (iItem == g_hoveredCloseButtonTab) {
                 HBRUSH hCloseBrush = CreateSolidBrush(RGB(232, 17, 35)); // 赤
                 FillRect(hdc, &rcClose, hCloseBrush);
@@ -1624,7 +1614,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (tab->searchTimerId) KillTimer(hWnd, tab->searchTimerId);
         }
         DeleteObject(hFont);
-        // AddButton用に作成したフォントも削除
         DeleteObject((HGDIOBJ)SendMessage(hAddButton, WM_GETFONT, 0, 0));
         PostQuitMessage(0);
         break;
@@ -1803,31 +1792,68 @@ void DrawCaptionButtons(HDC hdc, HWND hWnd) {
         int iState;
         BOOL bActive = (GetActiveWindow() == hWnd);
 
+        // --- 最小化ボタン ---
         iState = MINBS_NORMAL;
-        if (!bActive) iState = MINBS_INACTIVE;
-        else if (g_pressedButton == CaptionButtonState::Min) iState = MINBS_PUSHED;
-        else if (g_hoveredButton == CaptionButtonState::Min) iState = MINBS_HOT;
+        if (!bActive) {
+            iState = MINBS_INACTIVE;
+        }
+        else {
+            // ボタンが押されており、かつマウスが上にある場合のみ PUSHED 状態
+            if (g_pressedButton == CaptionButtonState::Min && g_hoveredButton == CaptionButtonState::Min) {
+                iState = MINBS_PUSHED;
+            }
+            // マウスが上にある場合は HOT 状態
+            else if (g_hoveredButton == CaptionButtonState::Min) {
+                iState = MINBS_HOT;
+            }
+        }
         DrawThemeBackground(hTheme, hdc, WP_MINBUTTON, iState, &g_rcMinButton, NULL);
 
+        // --- 最大化/元に戻すボタン ---
         if (IsZoomed(hWnd)) {
             iState = RBS_NORMAL;
-            if (!bActive) iState = RBS_INACTIVE;
-            else if (g_pressedButton == CaptionButtonState::Max) iState = RBS_PUSHED;
-            else if (g_hoveredButton == CaptionButtonState::Max) iState = RBS_HOT;
+            if (!bActive) {
+                iState = RBS_INACTIVE;
+            }
+            else {
+                if (g_pressedButton == CaptionButtonState::Max && g_hoveredButton == CaptionButtonState::Max) {
+                    iState = RBS_PUSHED;
+                }
+                else if (g_hoveredButton == CaptionButtonState::Max) {
+                    iState = RBS_HOT;
+                }
+            }
             DrawThemeBackground(hTheme, hdc, WP_RESTOREBUTTON, iState, &g_rcMaxButton, NULL);
         }
         else {
             iState = MAXBS_NORMAL;
-            if (!bActive) iState = MAXBS_INACTIVE;
-            else if (g_pressedButton == CaptionButtonState::Max) iState = MAXBS_PUSHED;
-            else if (g_hoveredButton == CaptionButtonState::Max) iState = MAXBS_HOT;
+            if (!bActive) {
+                iState = MAXBS_INACTIVE;
+            }
+            else {
+                if (g_pressedButton == CaptionButtonState::Max && g_hoveredButton == CaptionButtonState::Max) {
+                    iState = MAXBS_PUSHED;
+                }
+                else if (g_hoveredButton == CaptionButtonState::Max) {
+                    iState = MAXBS_HOT;
+                }
+            }
             DrawThemeBackground(hTheme, hdc, WP_MAXBUTTON, iState, &g_rcMaxButton, NULL);
         }
 
+        // --- 閉じるボタン ---
         iState = CBS_NORMAL;
-        if (!bActive) iState = CBS_INACTIVE;
-        else if (g_pressedButton == CaptionButtonState::Close) iState = CBS_PUSHED;
-        else if (g_hoveredButton == CaptionButtonState::Close) iState = CBS_HOT;
+        if (!bActive) {
+            iState = CBS_INACTIVE;
+        }
+        else {
+            if (g_pressedButton == CaptionButtonState::Close && g_hoveredButton == CaptionButtonState::Close) {
+                iState = CBS_PUSHED;
+            }
+            else if (g_hoveredButton == CaptionButtonState::Close) {
+                iState = CBS_HOT;
+            }
+        }
         DrawThemeBackground(hTheme, hdc, WP_CLOSEBUTTON, iState, &g_rcCloseButton, NULL);
 
         CloseThemeData(hTheme);
