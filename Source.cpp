@@ -667,6 +667,14 @@ LRESULT CALLBACK PathEditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
             }
             return 0;
         }
+        else if (wParam == VK_ESCAPE)
+        {
+            // テキストを現在のフォルダパスに戻す
+            SetWindowTextW(hWnd, pData->currentPath);
+            // テキストをすべて選択状態にする
+            SendMessageW(hWnd, EM_SETSEL, 0, -1);
+            return 0;
+        }
         else if (wParam == VK_DOWN) {
             SetFocus(pData->hList);
             if (ListView_GetItemCount(pData->hList) > 0) {
