@@ -16,7 +16,7 @@
 #include <dwmapi.h>
 #include <uxtheme.h>
 #include <vssym32.h>
-#include <Aclapi.h> // ★追加: 所有者情報取得のため
+#include <Aclapi.h>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -24,7 +24,7 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
-#pragma comment(lib, "advapi32.lib") // ★追加: 所有者情報取得のため
+#pragma comment(lib, "advapi32.lib")
 
 #define IDC_TAB 1000
 #define EDIT_ID_BASE 1001
@@ -70,7 +70,6 @@
 #define CBS_PUSHED 3
 #endif
 
-// ★追加: ファイル情報と所有者名を保持する構造体
 struct FileInfo {
     WIN32_FIND_DATAW findData;
     std::wstring owner;
@@ -80,7 +79,7 @@ struct ExplorerTabData {
     HWND hEdit;
     HWND hList;
     WCHAR currentPath[MAX_PATH];
-    std::vector<FileInfo> fileData; // ★修正: WIN32_FIND_DATAW から変更
+    std::vector<FileInfo> fileData;
     int sortColumn;
     bool sortAscending;
     std::wstring searchString;
@@ -113,6 +112,7 @@ void UpdateSortMark(ExplorerTabData* pData);
 void UpdateTabTitle(ExplorerTabData* pData);
 void UpdateCaptionButtonsRect(HWND hWnd);
 void DrawCaptionButtons(HDC hdc, HWND hWnd);
+void FileTimeToString(const FILETIME& ft, WCHAR* buf, size_t bufSize);
 
 
 ExplorerTabData* GetCurrentTabData() {
@@ -132,7 +132,6 @@ ExplorerTabData* GetTabDataFromChild(HWND hChild) {
     return nullptr;
 }
 
-// ★追加: ファイル所有者を取得するヘルパー関数
 std::wstring GetFileOwnerW(const WCHAR* filePath) {
     PSID pSidOwner = NULL;
     PSECURITY_DESCRIPTOR pSD = NULL;
@@ -166,20 +165,18 @@ std::wstring GetFileOwnerW(const WCHAR* filePath) {
             ownerName = szAccountName;
         }
         else {
-            // アカウント名の解決に失敗した場合
             ownerName = L"N/A";
         }
         LocalFree(pSD);
     }
     else {
-        // GetNamedSecurityInfoに失敗した場合
         ownerName = L"";
     }
 
     return ownerName;
 }
 
-bool CompareFunction(const FileInfo& a, const FileInfo& b, ExplorerTabData* pData) { // ★修正: 引数の型を変更
+bool CompareFunction(const FileInfo& a, const FileInfo& b, ExplorerTabData* pData) {
     if (wcscmp(a.findData.cFileName, L"..") == 0) return true;
     if (wcscmp(b.findData.cFileName, L"..") == 0) return false;
     const bool isDirA = (a.findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
@@ -207,7 +204,7 @@ bool CompareFunction(const FileInfo& a, const FileInfo& b, ExplorerTabData* pDat
     case 3:
         result = CompareFileTime(&a.findData.ftCreationTime, &b.findData.ftCreationTime);
         break;
-    case 4: // ★追加: 所有者でのソート
+    case 4:
         result = a.owner.compare(b.owner);
         break;
     }
@@ -217,7 +214,7 @@ bool CompareFunction(const FileInfo& a, const FileInfo& b, ExplorerTabData* pDat
 void ListDirectory(ExplorerTabData* pData) {
     pData->fileData.clear();
     if (PathIsRootW(pData->currentPath) == FALSE) {
-        FileInfo up_info = { 0 }; // ★修正
+        FileInfo up_info = { 0 };
         up_info.findData.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
         StringCchCopyW(up_info.findData.cFileName, MAX_PATH, L"..");
         pData->fileData.push_back(up_info);
@@ -229,20 +226,19 @@ void ListDirectory(ExplorerTabData* pData) {
     if (hFind != INVALID_HANDLE_VALUE) {
         do {
             if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
-                FileInfo info; // ★追加
-                info.findData = fd; // ★追加
+                FileInfo info;
+                info.findData = fd;
 
-                // ★追加: 所有者情報を取得
                 WCHAR fullPath[MAX_PATH];
                 PathCombineW(fullPath, pData->currentPath, fd.cFileName);
                 info.owner = GetFileOwnerW(fullPath);
 
-                pData->fileData.push_back(info); // ★修正
+                pData->fileData.push_back(info);
             }
         } while (FindNextFileW(hFind, &fd));
         FindClose(hFind);
     }
-    std::sort(pData->fileData.begin(), pData->fileData.end(), [&](const FileInfo& a, const FileInfo& b) { // ★修正
+    std::sort(pData->fileData.begin(), pData->fileData.end(), [&](const FileInfo& a, const FileInfo& b) {
         return CompareFunction(a, b, pData);
         });
     ListView_SetItemCountEx(pData->hList, pData->fileData.size(), LVSICF_NOINVALIDATEALL);
@@ -254,7 +250,7 @@ void GetSelectedFilePathsW(ExplorerTabData* pData, std::vector<std::wstring>& pa
     int iItem = -1;
     while ((iItem = ListView_GetNextItem(pData->hList, iItem, LVNI_SELECTED)) != -1) {
         if (iItem < (int)pData->fileData.size()) {
-            const WIN32_FIND_DATAW& fd = pData->fileData[iItem].findData; // ★修正
+            const WIN32_FIND_DATAW& fd = pData->fileData[iItem].findData;
             if (wcscmp(fd.cFileName, L"..") != 0) {
                 WCHAR fullPath[MAX_PATH];
                 PathCombineW(fullPath, pData->currentPath, fd.cFileName);
@@ -295,6 +291,64 @@ void DoCopyCut(HWND hWnd, bool isCut) {
     if (OpenClipboard(hWnd)) {
         EmptyClipboard();
         SetClipboardData(CF_HDROP, hGlobal);
+
+        if (!isCut) {
+            std::wstring tsv_text;
+            tsv_text += L"名前\tサイズ\t更新日時\t作成日時\t所有者\r\n";
+
+            int iItem = -1;
+            while ((iItem = ListView_GetNextItem(pData->hList, iItem, LVNI_SELECTED)) != -1) {
+                if (iItem >= (int)pData->fileData.size()) continue;
+
+                const FileInfo& info = pData->fileData[iItem];
+                const WIN32_FIND_DATAW& fd = info.findData;
+
+                if (wcscmp(fd.cFileName, L"..") == 0) continue;
+
+                WCHAR tempBuffer[256];
+
+                tsv_text += fd.cFileName;
+                tsv_text += L'\t';
+
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                }
+                else {
+                    ULARGE_INTEGER sz = { fd.nFileSizeLow, fd.nFileSizeHigh };
+                    StrFormatByteSizeW(sz.QuadPart, tempBuffer, ARRAYSIZE(tempBuffer));
+                    tsv_text += tempBuffer;
+                }
+                tsv_text += L'\t';
+
+                FileTimeToString(fd.ftLastWriteTime, tempBuffer, ARRAYSIZE(tempBuffer));
+                tsv_text += tempBuffer;
+                tsv_text += L'\t';
+
+                FileTimeToString(fd.ftCreationTime, tempBuffer, ARRAYSIZE(tempBuffer));
+                tsv_text += tempBuffer;
+                tsv_text += L'\t';
+
+                tsv_text += info.owner;
+
+                tsv_text += L"\r\n";
+            }
+
+            if (!tsv_text.empty()) {
+                HGLOBAL hText = GlobalAlloc(GMEM_MOVEABLE, (tsv_text.length() + 1) * sizeof(WCHAR));
+                if (hText) {
+                    WCHAR* pText = (WCHAR*)GlobalLock(hText);
+                    if (pText) {
+                        StringCchCopyW(pText, tsv_text.length() + 1, tsv_text.c_str());
+                        GlobalUnlock(hText);
+                        SetClipboardData(CF_UNICODETEXT, hText);
+                    }
+                    else {
+                        GlobalFree(hText);
+                    }
+                }
+            }
+        }
+
+
         if (isCut) {
             HGLOBAL hEffect = GlobalAlloc(GHND | GMEM_SHARE, sizeof(DWORD));
             if (hEffect) {
@@ -432,7 +486,7 @@ void ShowContextMenu(HWND hWnd, ExplorerTabData* pData, int iItem, POINT pt) {
         int currentSel = -1;
         while ((currentSel = ListView_GetNextItem(pData->hList, currentSel, LVNI_SELECTED)) != -1) {
             if (currentSel < (int)pData->fileData.size()) {
-                const WIN32_FIND_DATAW& fd = pData->fileData[currentSel].findData; // ★修正
+                const WIN32_FIND_DATAW& fd = pData->fileData[currentSel].findData;
                 if (wcscmp(fd.cFileName, L"..") == 0) continue;
                 LPITEMIDLIST pidlItem = nullptr;
                 if (SUCCEEDED(pParentFolder->ParseDisplayName(hWnd, NULL, (LPWSTR)fd.cFileName, NULL, &pidlItem, NULL))) {
@@ -490,7 +544,7 @@ void NavigateUpAndSelect(HWND hWnd) {
         ListDirectory(pData);
         UpdateSortMark(pData);
         for (size_t i = 0; i < pData->fileData.size(); ++i) {
-            if (wcscmp(pData->fileData[i].findData.cFileName, previousFolderName) == 0) { // ★修正
+            if (wcscmp(pData->fileData[i].findData.cFileName, previousFolderName) == 0) {
                 ListView_SetItemState(pData->hList, (int)i, LVIS_FOCUSED | LVIS_SELECTED, LVIS_FOCUSED | LVIS_SELECTED);
                 ListView_EnsureVisible(pData->hList, (int)i, FALSE);
                 break;
@@ -504,7 +558,7 @@ void NavigateToSelected(ExplorerTabData* pData) {
     if (sel < 0 || sel >= (int)pData->fileData.size()) {
         return;
     }
-    const WIN32_FIND_DATAW& fd = pData->fileData[sel].findData; // ★修正
+    const WIN32_FIND_DATAW& fd = pData->fileData[sel].findData;
     if (wcscmp(fd.cFileName, L"..") == 0) {
         NavigateUpAndSelect(GetParent(pData->hList));
         return;
@@ -563,6 +617,28 @@ LRESULT CALLBACK EditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lP
 
     switch (uMsg)
     {
+    case WM_NCHITTEST:
+    {
+        LRESULT hit = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+        if (hit == HTCLIENT) {
+            RECT rcWindow;
+            GetWindowRect(hWnd, &rcWindow);
+            POINT ptScreen = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+
+            constexpr int BORDER_WIDTH = 8;
+
+            if (ptScreen.x >= rcWindow.left && ptScreen.x < rcWindow.left + BORDER_WIDTH) {
+                return HTTRANSPARENT;
+            }
+            if (ptScreen.x < rcWindow.right && ptScreen.x >= rcWindow.right - BORDER_WIDTH) {
+                return HTTRANSPARENT;
+            }
+            if (ptScreen.y < rcWindow.bottom && ptScreen.y >= rcWindow.bottom - BORDER_WIDTH) {
+                return HTTRANSPARENT;
+            }
+        }
+        return hit;
+    }
     case WM_KEYDOWN:
         if (wParam == VK_RETURN)
         {
@@ -708,7 +784,7 @@ void PerformIncrementalSearch(ExplorerTabData* pData) {
     int currentIndex = ListView_GetNextItem(pData->hList, -1, LVNI_FOCUSED);
     int startIndex = (currentIndex == -1) ? 0 : currentIndex;
     for (size_t i = startIndex + 1; i < pData->fileData.size(); ++i) {
-        if (StrCmpNIW(pData->fileData[i].findData.cFileName, pData->searchString.c_str(), pData->searchString.length()) == 0) { // ★修正
+        if (StrCmpNIW(pData->fileData[i].findData.cFileName, pData->searchString.c_str(), pData->searchString.length()) == 0) {
             ListView_SetItemState(pData->hList, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
             ListView_SetItemState(pData->hList, (int)i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_FOCUSED | LVIS_SELECTED);
             ListView_EnsureVisible(pData->hList, (int)i, FALSE);
@@ -716,7 +792,7 @@ void PerformIncrementalSearch(ExplorerTabData* pData) {
         }
     }
     for (int i = 0; i <= startIndex; ++i) {
-        if (StrCmpNIW(pData->fileData[i].findData.cFileName, pData->searchString.c_str(), pData->searchString.length()) == 0) { // ★修正
+        if (StrCmpNIW(pData->fileData[i].findData.cFileName, pData->searchString.c_str(), pData->searchString.length()) == 0) {
             ListView_SetItemState(pData->hList, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
             ListView_SetItemState(pData->hList, i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
             ListView_EnsureVisible(pData->hList, i, FALSE);
@@ -730,6 +806,28 @@ LRESULT CALLBACK ListSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lP
     if (!pData) return DefSubclassProc(hWnd, uMsg, wParam, lParam);
 
     switch (uMsg) {
+    case WM_NCHITTEST:
+    {
+        LRESULT hit = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+        if (hit == HTCLIENT) {
+            RECT rcWindow;
+            GetWindowRect(hWnd, &rcWindow);
+            POINT ptScreen = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+
+            constexpr int BORDER_WIDTH = 8;
+
+            if (ptScreen.x >= rcWindow.left && ptScreen.x < rcWindow.left + BORDER_WIDTH) {
+                return HTTRANSPARENT;
+            }
+            if (ptScreen.x < rcWindow.right && ptScreen.x >= rcWindow.right - BORDER_WIDTH) {
+                return HTTRANSPARENT;
+            }
+            if (ptScreen.y < rcWindow.bottom && ptScreen.y >= rcWindow.bottom - BORDER_WIDTH) {
+                return HTTRANSPARENT;
+            }
+        }
+        return hit;
+    }
     case WM_CHAR:
     {
         if (pData->searchTimerId) {
@@ -751,13 +849,12 @@ LRESULT CALLBACK ListSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lP
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+    case WM_NCACTIVATE:
+        return 1;
+    case WM_NCPAINT:
+        return 0;
     case WM_NCCALCSIZE:
-    {
-        if (wParam == TRUE) {
-            return 0;
-        }
-        break;
-    }
+        return 0;
     case WM_NCHITTEST:
     {
         POINT ptScreen = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
@@ -863,7 +960,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_CREATE:
     {
         hFont = CreateFontW(20, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, 0, L"Segoe UI");
-        MARGINS margins = { 0, 0, 32, 0 };
+        MARGINS margins = { 0, 0, 1, 0 };
         DwmExtendFrameIntoClientArea(hWnd, &margins);
         SetWindowPos(hWnd, NULL, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER);
         hTab = CreateWindowW(WC_TABCONTROLW, 0, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_OWNERDRAWFIXED | TCS_BUTTONS,
@@ -930,6 +1027,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hWnd, &ps);
+
+        RECT rcClient;
+        GetClientRect(hWnd, &rcClient);
+        RECT rcTitleBar = { 0, 0, rcClient.right, 32 };
+
+        HBRUSH hBrush = CreateSolidBrush(GetSysColor(COLOR_BTNFACE));
+        FillRect(hdc, &rcTitleBar, hBrush);
+        DeleteObject(hBrush);
+
         DrawCaptionButtons(hdc, hWnd);
         EndPaint(hWnd, &ps);
         return 0;
@@ -985,9 +1091,23 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 DTTOPTS dttOpts = { sizeof(dttOpts) };
                 dttOpts.dwFlags = DTT_COMPOSITED | DTT_TEXTCOLOR;
                 DrawThemeTextEx(hTheme, hdc, TABP_TABITEM, iState, szText, -1, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, &rcText, &dttOpts);
-                int iCloseState = TCBS_NORMAL;
-                if (iItem == g_hoveredCloseButtonTab) iCloseState = TCBS_HOT;
-                DrawThemeBackground(hTheme, hdc, TABP_CLOSEBUTTON, iCloseState, &rcClose, NULL);
+
+                const WCHAR szClose[] = L"×";
+                SetBkMode(hdc, TRANSPARENT);
+
+                if (iItem == g_hoveredCloseButtonTab) {
+                    HBRUSH hBrush = CreateSolidBrush(RGB(255, 0, 0));
+                    FillRect(hdc, &rcClose, hBrush);
+                    DeleteObject(hBrush);
+                    SetTextColor(hdc, RGB(255, 255, 255));
+                }
+                else {
+                    DrawThemeBackground(hTheme, hdc, TABP_CLOSEBUTTON, TCBS_NORMAL, &rcClose, NULL);
+                    SetTextColor(hdc, RGB(0, 0, 0));
+                }
+
+                DrawTextW(hdc, szClose, -1, &rcClose, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
                 CloseThemeData(hTheme);
             }
             if (lpdis->itemState & ODS_FOCUS) {
@@ -1122,8 +1242,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     NMLVDISPINFO* plvdi = (NMLVDISPINFO*)lParam;
                     LVITEM* pItem = &(plvdi->item);
                     if (pItem->iItem >= (int)pData->fileData.size()) break;
-                    const FileInfo& info = pData->fileData[pItem->iItem]; // ★修正
-                    const WIN32_FIND_DATAW& fd = info.findData; // ★修正
+                    const FileInfo& info = pData->fileData[pItem->iItem];
+                    const WIN32_FIND_DATAW& fd = info.findData;
                     if (pItem->mask & LVIF_TEXT) {
                         switch (pItem->iSubItem) {
                         case 0: StringCchCopy(pItem->pszText, pItem->cchTextMax, fd.cFileName); break;
@@ -1146,7 +1266,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                 pItem->pszText[0] = L'\0';
                             }
                             break;
-                        case 4: // ★追加: 所有者情報の表示
+                        case 4:
                             StringCchCopy(pItem->pszText, pItem->cchTextMax, info.owner.c_str());
                             break;
                         }
@@ -1171,7 +1291,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         pData->sortColumn = clickedColumn;
                         pData->sortAscending = true;
                     }
-                    std::sort(pData->fileData.begin(), pData->fileData.end(), [&](const FileInfo& a, const FileInfo& b) { // ★修正
+                    std::sort(pData->fileData.begin(), pData->fileData.end(), [&](const FileInfo& a, const FileInfo& b) {
                         return CompareFunction(a, b, pData);
                         });
                     UpdateSortMark(pData);
@@ -1207,10 +1327,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     break;
                     case 'A':
                         if (GetKeyState(VK_CONTROL) & 0x8000) {
-							int itemCount = ListView_GetItemCount(pData->hList);
-							for (int i = 0; i < itemCount; ++i) {
-								ListView_SetItemState(pData->hList, i, LVIS_SELECTED, LVIS_SELECTED);
-							}
+                            int itemCount = ListView_GetItemCount(pData->hList);
+                            for (int i = 0; i < itemCount; ++i) {
+                                ListView_SetItemState(pData->hList, i, LVIS_SELECTED, LVIS_SELECTED);
+                            }
                         }
                         break;
                     case 'C':
@@ -1300,7 +1420,7 @@ void AddNewTab(HWND hWnd, LPCWSTR initialPath) {
     lvc.fmt = LVCFMT_RIGHT; lvc.cx = 100; lvc.pszText = (LPWSTR)L"サイズ"; ListView_InsertColumn(pData->hList, 1, &lvc);
     lvc.fmt = LVCFMT_LEFT; lvc.cx = 150; lvc.pszText = (LPWSTR)L"更新日時"; ListView_InsertColumn(pData->hList, 2, &lvc);
     lvc.fmt = LVCFMT_LEFT; lvc.cx = 150; lvc.pszText = (LPWSTR)L"作成日時"; ListView_InsertColumn(pData->hList, 3, &lvc);
-    lvc.fmt = LVCFMT_LEFT; lvc.cx = 150; lvc.pszText = (LPWSTR)L"所有者"; ListView_InsertColumn(pData->hList, 4, &lvc); // ★追加
+    lvc.fmt = LVCFMT_LEFT; lvc.cx = 150; lvc.pszText = (LPWSTR)L"所有者"; ListView_InsertColumn(pData->hList, 4, &lvc);
 
     SetWindowTextW(pData->hEdit, pData->currentPath);
     ListDirectory(pData.get());
@@ -1484,7 +1604,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPreInst, LPWSTR pCmdLine, in
         hInstance,
         LoadIcon(hInstance, MAKEINTRESOURCE(IDI_ICON1)),
         LoadCursor(0,IDC_ARROW),
-        (HBRUSH)GetStockObject(BLACK_BRUSH),
+        0,
         0,
         szClassName
     };
