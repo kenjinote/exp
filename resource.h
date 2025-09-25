@@ -15,13 +15,14 @@
 #define ID_ACCELERATOR_CLOSE_TAB        40012
 #define ID_ACCELERATOR_NEXT_TAB         40014
 #define ID_ACCELERATOR_PREV_TAB         40015
+#define ID_ACCELERATOR_SELECT_ALL       40019
 
 // Next default values for new objects
 // 
 #ifdef APSTUDIO_INVOKED
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define _APS_NEXT_RESOURCE_VALUE        103
-#define _APS_NEXT_COMMAND_VALUE         40019
+#define _APS_NEXT_COMMAND_VALUE         40021
 #define _APS_NEXT_CONTROL_VALUE         1001
 #define _APS_NEXT_SYMED_VALUE           101
 #endif
