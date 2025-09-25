@@ -21,8 +21,9 @@
   <PropertyGroup Label="Globals">
     <ProjectGuid>{D327119E-D676-4F87-B0AF-08D64AE6AC1A}</ProjectGuid>
     <Keyword>Win32Proj</Keyword>
-    <RootNamespace>exp</RootNamespace>
+    <RootNamespace>fai</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <ProjectName>fai</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
@@ -168,7 +169,7 @@
     <ClInclude Include="resource.h" />
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="exp.rc" />
+    <ResourceCompile Include="fai.rc" />
   </ItemGroup>
   <ItemGroup>
     <Image Include="resource\icon.ico" />

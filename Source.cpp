@@ -87,7 +87,7 @@ struct ExplorerTabData {
     bool bProgrammaticPathChange;
 };
 
-WCHAR szClassName[] = L"exp";
+WCHAR szClassName[] = L"fai";
 static HWND hTab;
 static HWND hAddButton;
 static HFONT hFont;
