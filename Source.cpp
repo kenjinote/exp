@@ -1143,25 +1143,37 @@ LRESULT CALLBACK ListSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lP
     switch (uMsg) {
     case WM_NCHITTEST:
     {
-        LRESULT hit = DefSubclassProc(hWnd, uMsg, wParam, lParam);
-        if (hit == HTCLIENT) {
-            RECT rcWindow;
-            GetWindowRect(hWnd, &rcWindow);
-            POINT ptScreen = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        // Get the cursor's screen coordinates from the message parameters.
+        POINT ptScreen = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        // Get the list view's window rectangle in screen coordinates.
+        RECT rcWindow;
+        GetWindowRect(hWnd, &rcWindow);
 
-            constexpr int BORDER_WIDTH = 8;
+        // Define the width of the resizing border, consistent with the main window's handler.
+        constexpr int BORDER_WIDTH = 8;
 
-            if (ptScreen.x >= rcWindow.left && ptScreen.x < rcWindow.left + BORDER_WIDTH) {
-                return HTTRANSPARENT;
-            }
-            if (ptScreen.x < rcWindow.right && ptScreen.x >= rcWindow.right - BORDER_WIDTH) {
-                return HTTRANSPARENT;
-            }
-            if (ptScreen.y < rcWindow.bottom && ptScreen.y >= rcWindow.bottom - BORDER_WIDTH) {
-                return HTTRANSPARENT;
-            }
+        // To allow the parent window to handle resizing, we check if the cursor is
+        // over the border areas of this child window (the ListView).
+        // If it is, we return HTTRANSPARENT, which tells Windows to send the message
+        // to the underlying window (the parent). The parent's WM_NCHITTEST handler
+        // will then correctly return HTRIGHT, HTBOTTOM, HTBOTTOMRIGHT, etc.
+        // This check must be performed regardless of whether the cursor is over the
+        // list view's client area or its non-client scrollbars.
+
+        if (ptScreen.x >= rcWindow.left && ptScreen.x < rcWindow.left + BORDER_WIDTH) {
+            return HTTRANSPARENT; // For left-side resizing
         }
-        return hit;
+        if (ptScreen.x < rcWindow.right && ptScreen.x >= rcWindow.right - BORDER_WIDTH) {
+            return HTTRANSPARENT; // For right-side resizing
+        }
+        if (ptScreen.y < rcWindow.bottom && ptScreen.y >= rcWindow.bottom - BORDER_WIDTH) {
+            return HTTRANSPARENT; // For bottom-side resizing
+        }
+
+        // If the cursor is not on a resizing border, we let the default window procedure
+        // for the ListView handle the message. This allows normal interaction with the
+        // list items and scrollbars.
+        return DefSubclassProc(hWnd, uMsg, wParam, lParam);
     }
     case WM_CHAR:
     {
@@ -1356,7 +1368,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     case WM_CREATE:
     {
-        hFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, 0, L"Segoe UI");
+        hFont = CreateFontW(20, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, 0, L"Segoe UI");
         MARGINS margins = { 0, 0, 1, 0 };
         DwmExtendFrameIntoClientArea(hWnd, &margins);
         SetWindowPos(hWnd, NULL, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER);
@@ -1606,15 +1618,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessage(hPathEdit, EM_SETSEL, 0, -1);
             break;
         case ID_ACCELERATOR_TAB:
-        {
-            HWND hFocus = GetFocus();
-            if (hFocus == hPathEdit) SetFocus(pData->hList);
-            else {
-                SetFocus(hPathEdit);
-                SendMessage(hPathEdit, EM_SETSEL, 0, -1);
+            {
+                HWND hFocus = GetFocus();
+                if (hFocus == hPathEdit) SetFocus(pData->hList);
+                else if (hFocus == pData->hList) {
+                    SetFocus(hTab);
+                } else if (hFocus == hTab) {
+                    SetFocus(hAddButton);
+                } else {
+                    SetFocus(hPathEdit);
+                    SendMessage(hPathEdit, EM_SETSEL, 0, -1);
+                }
             }
-        }
-        break;
+            break;
         case ID_ACCELERATOR_REFRESH:
             ListDirectory(hWnd, pData);
             UpdateSortMark(pData);
