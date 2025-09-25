@@ -689,71 +689,74 @@ LRESULT CALLBACK EditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lP
 LRESULT CALLBACK TabSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
     static bool bTracking = false;
+    static bool g_isDragging = false;
+    static int g_draggedTab = -1;
+    static POINT g_ptDragStart;
+
+    static int g_markIndex = -1;
+    static BOOL g_markAfter = FALSE;
 
     switch (uMsg)
     {
-    case WM_MOUSEMOVE:
+    case WM_PAINT:
     {
-        if (!bTracking) {
-            TRACKMOUSEEVENT tme = { sizeof(tme) };
-            tme.dwFlags = TME_LEAVE;
-            tme.hwndTrack = hWnd;
-            if (TrackMouseEvent(&tme)) {
-                bTracking = true;
+        LRESULT result = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+
+        if (g_isDragging && g_markIndex != -1) {
+            bool isAtStart = (!g_markAfter && g_markIndex == g_draggedTab) || (g_markAfter && g_markIndex == g_draggedTab - 1);
+            bool isAtEnd = (g_markAfter && g_markIndex == g_draggedTab) || (!g_markAfter && g_markIndex == g_draggedTab + 1);
+
+            if (!(isAtStart || isAtEnd)) {
+                HDC hdc = GetDC(hWnd);
+
+                int x;
+                RECT rcCurrent;
+                TabCtrl_GetItemRect(hWnd, g_markIndex, &rcCurrent);
+
+                if (g_markAfter) {
+                    int nextIndex = g_markIndex + 1;
+                    if (nextIndex < TabCtrl_GetItemCount(hWnd)) {
+                        RECT rcNext;
+                        TabCtrl_GetItemRect(hWnd, nextIndex, &rcNext);
+                        x = rcCurrent.right + (rcNext.left - rcCurrent.right) / 2;
+                    }
+                    else {
+                        x = rcCurrent.right;
+                    }
+                }
+                else {
+                    if (g_markIndex > 0) {
+                        RECT rcPrev;
+                        TabCtrl_GetItemRect(hWnd, g_markIndex - 1, &rcPrev);
+                        x = rcPrev.right + (rcCurrent.left - rcPrev.right) / 2;
+                    }
+                    else {
+                        x = rcCurrent.left;
+                    }
+                }
+
+                LOGBRUSH lb;
+                lb.lbStyle = BS_SOLID;
+                lb.lbColor = RGB(0, 0, 0);
+                HPEN hPen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_SQUARE, 3, &lb, 0, NULL);
+
+                HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+                MoveToEx(hdc, x, rcCurrent.top + 2, NULL);
+                LineTo(hdc, x, rcCurrent.bottom - 2);
+                SelectObject(hdc, hOldPen);
+                DeleteObject(hPen);
+                ReleaseDC(hWnd, hdc);
             }
         }
-
-        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-        TCHITTESTINFO hti = { pt, 0 };
-        int tabItem = TabCtrl_HitTest(hWnd, &hti);
-        int currentlyHoveredTab = -1;
-
-        if (tabItem != -1) {
-            RECT rcItem;
-            TabCtrl_GetItemRect(hWnd, tabItem, &rcItem);
-            RECT rcClose = rcItem;
-            rcClose.left = rcClose.right - 22;
-            if (PtInRect(&rcClose, pt)) {
-                currentlyHoveredTab = tabItem;
-            }
-        }
-
-        if (currentlyHoveredTab != g_hoveredCloseButtonTab) {
-            int oldHoveredTab = g_hoveredCloseButtonTab;
-            g_hoveredCloseButtonTab = currentlyHoveredTab;
-
-            if (oldHoveredTab != -1) {
-                RECT rcItem;
-                TabCtrl_GetItemRect(hWnd, oldHoveredTab, &rcItem);
-                InvalidateRect(hWnd, &rcItem, FALSE);
-            }
-            if (g_hoveredCloseButtonTab != -1) {
-                RECT rcItem;
-                TabCtrl_GetItemRect(hWnd, g_hoveredCloseButtonTab, &rcItem);
-                InvalidateRect(hWnd, &rcItem, FALSE);
-            }
-        }
-        break;
-    }
-
-    case WM_MOUSELEAVE:
-    {
-        if (g_hoveredCloseButtonTab != -1) {
-            int oldHoveredTab = g_hoveredCloseButtonTab;
-            g_hoveredCloseButtonTab = -1;
-            RECT rcItem;
-            TabCtrl_GetItemRect(hWnd, oldHoveredTab, &rcItem);
-            InvalidateRect(hWnd, &rcItem, FALSE);
-        }
-        bTracking = false;
-        return 0;
+        return result;
     }
 
     case WM_LBUTTONDOWN:
     {
         TCHITTESTINFO hti;
-        hti.pt.x = GET_X_LPARAM(lParam);
-        hti.pt.y = GET_Y_LPARAM(lParam);
+        g_ptDragStart.x = hti.pt.x = GET_X_LPARAM(lParam);
+        g_ptDragStart.y = hti.pt.y = GET_Y_LPARAM(lParam);
+        g_markIndex = -1;
 
         int iTab = TabCtrl_HitTest(hWnd, &hti);
         if (iTab != -1)
@@ -768,14 +771,219 @@ LRESULT CALLBACK TabSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
                 CloseTab(GetParent(hWnd), iTab);
                 return 0;
             }
+            else
+            {
+                g_draggedTab = iTab;
+                g_isDragging = true;
+                SetCapture(hWnd);
+                return 0;
+            }
         }
         break;
+    }
+
+    case WM_LBUTTONUP:
+    {
+        if (g_isDragging) {
+            ReleaseCapture();
+            g_isDragging = false;
+
+            g_markIndex = -1;
+            InvalidateRect(hWnd, NULL, TRUE);
+
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(hWnd, &pt);
+
+            if (abs(pt.x - g_ptDragStart.x) < GetSystemMetrics(SM_CXDRAG) &&
+                abs(pt.y - g_ptDragStart.y) < GetSystemMetrics(SM_CYDRAG))
+            {
+                SwitchTab(GetParent(hWnd), g_draggedTab);
+                g_draggedTab = -1;
+                return 0;
+            }
+
+            TCHITTESTINFO hti = { 0 };
+            hti.pt = pt;
+
+            // Y座標をタブの中央に固定し、X軸だけでヒットテストを行う
+            if (TabCtrl_GetItemCount(hWnd) > 0) {
+                RECT rcFirstTab;
+                TabCtrl_GetItemRect(hWnd, 0, &rcFirstTab);
+                hti.pt.y = rcFirstTab.top + (rcFirstTab.bottom - rcFirstTab.top) / 2;
+            }
+
+            int dropIndex = TabCtrl_HitTest(hWnd, &hti);
+            int finalDropIndex = -1;
+
+            if (dropIndex != -1) {
+                RECT rcItem;
+                TabCtrl_GetItemRect(hWnd, dropIndex, &rcItem);
+                BOOL fAfter = (pt.x > rcItem.left + (rcItem.right - rcItem.left) / 2);
+                finalDropIndex = dropIndex;
+                if (fAfter) {
+                    finalDropIndex++;
+                }
+            }
+            else {
+                int tabCount = TabCtrl_GetItemCount(hWnd);
+                if (tabCount > 0) {
+                    RECT rcFirst, rcLast;
+                    TabCtrl_GetItemRect(hWnd, 0, &rcFirst);
+                    TabCtrl_GetItemRect(hWnd, tabCount - 1, &rcLast);
+                    if (pt.x < rcFirst.left) {
+                        finalDropIndex = 0;
+                    }
+                    else if (pt.x > rcLast.right) {
+                        finalDropIndex = tabCount;
+                    }
+                    else {
+                        g_draggedTab = -1;
+                        return 0;
+                    }
+                }
+            }
+
+            if (g_draggedTab != -1 && finalDropIndex != g_draggedTab && finalDropIndex != g_draggedTab + 1) {
+                if (finalDropIndex > g_draggedTab) {
+                    finalDropIndex--;
+                }
+
+                if (finalDropIndex >= 0 && finalDropIndex <= (int)g_tabs.size() && finalDropIndex != g_draggedTab) {
+                    auto draggedData = std::move(g_tabs[g_draggedTab]);
+                    g_tabs.erase(g_tabs.begin() + g_draggedTab);
+                    g_tabs.insert(g_tabs.begin() + finalDropIndex, std::move(draggedData));
+
+                    WCHAR szText[MAX_PATH];
+                    TCITEMW tci = { TCIF_TEXT };
+                    tci.pszText = szText;
+                    tci.cchTextMax = MAX_PATH;
+
+                    TabCtrl_GetItem(hWnd, g_draggedTab, &tci);
+                    TabCtrl_DeleteItem(hWnd, g_draggedTab);
+                    TabCtrl_InsertItem(hWnd, finalDropIndex, &tci);
+
+                    SwitchTab(GetParent(hWnd), finalDropIndex);
+                }
+            }
+
+            g_draggedTab = -1;
+            return 0;
+        }
+        break;
+    }
+
+    case WM_MOUSEMOVE:
+    {
+        if (g_isDragging) {
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(hWnd, &pt);
+
+            if (abs(pt.x - g_ptDragStart.x) < GetSystemMetrics(SM_CXDRAG) &&
+                abs(pt.y - g_ptDragStart.y) < GetSystemMetrics(SM_CYDRAG)) {
+                return 0;
+            }
+
+            TCHITTESTINFO hti = { 0 };
+            hti.pt = pt;
+
+            // Y座標をタブの中央に固定し、X軸だけでヒットテストを行う
+            if (TabCtrl_GetItemCount(hWnd) > 0) {
+                RECT rcFirstTab;
+                TabCtrl_GetItemRect(hWnd, 0, &rcFirstTab);
+                hti.pt.y = rcFirstTab.top + (rcFirstTab.bottom - rcFirstTab.top) / 2;
+            }
+
+            int dropIndex = TabCtrl_HitTest(hWnd, &hti);
+
+            int newMarkIndex = -1;
+            BOOL newMarkAfter = FALSE;
+
+            if (dropIndex != -1) {
+                newMarkIndex = dropIndex;
+                RECT rcItem;
+                TabCtrl_GetItemRect(hWnd, dropIndex, &rcItem);
+                newMarkAfter = (pt.x > rcItem.left + (rcItem.right - rcItem.left) / 2);
+            }
+            else {
+                int tabCount = TabCtrl_GetItemCount(hWnd);
+                if (tabCount > 0) {
+                    RECT rcFirst, rcLast;
+                    TabCtrl_GetItemRect(hWnd, 0, &rcFirst);
+                    TabCtrl_GetItemRect(hWnd, tabCount - 1, &rcLast);
+                    if (pt.x < rcFirst.left) {
+                        newMarkIndex = 0;
+                        newMarkAfter = FALSE;
+                    }
+                    else if (pt.x > rcLast.right) {
+                        newMarkIndex = tabCount - 1;
+                        newMarkAfter = TRUE;
+                    }
+                }
+            }
+
+            if (g_markIndex != newMarkIndex || g_markAfter != newMarkAfter) {
+                g_markIndex = newMarkIndex;
+                g_markAfter = newMarkAfter;
+                InvalidateRect(hWnd, NULL, TRUE);
+            }
+            return 0;
+        }
+
+        if (!bTracking) {
+            TRACKMOUSEEVENT tme = { sizeof(tme) };
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hWnd;
+            if (TrackMouseEvent(&tme)) {
+                bTracking = true;
+            }
+        }
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        TCHITTESTINFO hti = { pt, 0 };
+        int tabItem = TabCtrl_HitTest(hWnd, &hti);
+        int currentlyHoveredTab = -1;
+        if (tabItem != -1) {
+            RECT rcItem;
+            TabCtrl_GetItemRect(hWnd, tabItem, &rcItem);
+            RECT rcClose = rcItem;
+            rcClose.left = rcClose.right - 22;
+            if (PtInRect(&rcClose, pt)) {
+                currentlyHoveredTab = tabItem;
+            }
+        }
+        if (currentlyHoveredTab != g_hoveredCloseButtonTab) {
+            int oldHoveredTab = g_hoveredCloseButtonTab;
+            g_hoveredCloseButtonTab = currentlyHoveredTab;
+            if (oldHoveredTab != -1) {
+                RECT rcItem;
+                TabCtrl_GetItemRect(hWnd, oldHoveredTab, &rcItem);
+                InvalidateRect(hWnd, &rcItem, FALSE);
+            }
+            if (g_hoveredCloseButtonTab != -1) {
+                RECT rcItem;
+                TabCtrl_GetItemRect(hWnd, g_hoveredCloseButtonTab, &rcItem);
+                InvalidateRect(hWnd, &rcItem, FALSE);
+            }
+        }
+        break;
+    }
+    case WM_MOUSELEAVE:
+    {
+        if (g_hoveredCloseButtonTab != -1) {
+            int oldHoveredTab = g_hoveredCloseButtonTab;
+            g_hoveredCloseButtonTab = -1;
+            RECT rcItem;
+            TabCtrl_GetItemRect(hWnd, oldHoveredTab, &rcItem);
+            InvalidateRect(hWnd, &rcItem, FALSE);
+        }
+        bTracking = false;
+        return 0;
     }
     case WM_NCDESTROY:
         RemoveWindowSubclass(hWnd, TabSubclassProc, uIdSubclass);
         break;
     }
-
     return DefSubclassProc(hWnd, uMsg, wParam, lParam);
 }
 
@@ -1610,7 +1818,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPreInst, LPWSTR pCmdLine, in
     };
     RegisterClassW(&wndclass);
     HWND hWnd = CreateWindowEx(0,
-        szClassName, L"タブファイラ",
+        szClassName, L"fai",
         WS_POPUP | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CLIPCHILDREN,
         CW_USEDEFAULT, 0, 900, 600,
         0, 0, hInstance, 0);
