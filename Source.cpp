@@ -841,6 +841,7 @@ void ShowContextMenu(HWND hWnd, ExplorerTabData* pData, int iItem, POINT pt) {
                     cmi.lpVerb = MAKEINTRESOURCEA(idCmd - 1);
                     cmi.nShow = SW_SHOWNORMAL;
                     pContextMenu->InvokeCommand(&cmi);
+                    // [変更] 名前の変更などの操作後にリストを更新する
                     ListDirectory(hWnd, pData);
                 }
             }
@@ -1987,6 +1988,48 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                 }
                 break;
+                // [追加] 名前の変更完了通知の処理
+                case LVN_ENDLABELEDITW:
+                {
+                    NMLVDISPINFO* pdi = (NMLVDISPINFO*)lParam;
+                    // pdi->item.pszText が NULL の場合はユーザーがEscキーでキャンセルしたことを示す
+                    if (pdi->item.pszText != NULL && pdi->item.iItem != -1)
+                    {
+                        // 元のファイル情報を取得
+                        const FileInfo& info = pData->fileData[pdi->item.iItem];
+
+                        // 古いパスと新しいパスを構築
+                        WCHAR oldPath[MAX_PATH];
+                        WCHAR newPath[MAX_PATH];
+                        PathCombineW(oldPath, pData->currentPath, info.findData.cFileName);
+                        PathCombineW(newPath, pData->currentPath, pdi->item.pszText);
+
+                        // 名前の変更を実行
+                        if (MoveFileW(oldPath, newPath))
+                        {
+                            std::wstring newNameStr = pdi->item.pszText;
+                            // 成功したらディレクトリを再読み込み
+                            ListDirectory(hWnd, pData);
+                            // 名前変更後のアイテムを再選択する
+                            for (size_t i = 0; i < pData->fileData.size(); ++i) {
+                                if (wcscmp(pData->fileData[i].findData.cFileName, newNameStr.c_str()) == 0) {
+                                    ListView_SetItemState(pData->hList, (int)i, LVIS_FOCUSED | LVIS_SELECTED, LVIS_FOCUSED | LVIS_SELECTED);
+                                    ListView_EnsureVisible(pData->hList, (int)i, FALSE);
+                                    break;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // 失敗したらエラーメッセージを表示
+                            MessageBoxW(hWnd, L"名前の変更に失敗しました。\nファイルが開かれているか、同じ名前のファイルが既に存在する可能性があります。", L"エラー", MB_OK | MB_ICONERROR);
+                            return FALSE; // ラベルの変更を拒否
+                        }
+                        return TRUE; // ラベルの変更を許可
+                    }
+                    return FALSE; // キャンセルされたので変更を拒否
+                }
+                break;
                 case LVN_COLUMNCLICK:
                 {
                     LPNMLISTVIEW pnmv = (LPNMLISTVIEW)lParam;
@@ -2026,6 +2069,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     case VK_DELETE:
                         DoDelete(hWnd, GetKeyState(VK_SHIFT) & 0x8000);
                         break;
+                        // [追加] F2キーで名前の変更を開始
+                    case VK_F2:
+                    {
+                        int sel = ListView_GetNextItem(pData->hList, -1, LVNI_SELECTED | LVNI_FOCUSED);
+                        if (sel != -1) {
+                            // ".." の名前は変更させない
+                            if (wcscmp(pData->fileData[sel].findData.cFileName, L"..") != 0) {
+                                ListView_EditLabel(pData->hList, sel);
+                            }
+                        }
+                        break;
+                    }
                     case VK_APPS:
                     {
                         POINT pt = {};
@@ -2109,7 +2164,8 @@ void AddNewTab(HWND hWnd, LPCWSTR initialPath) {
 
     int tabIndex = (int)g_tabs.size();
 
-    pData->hList = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | LVS_REPORT | LVS_OWNERDATA,
+    // [変更] LVS_EDITLABELS スタイルを追加して、アイテム名のインプレース編集を有効にする
+    pData->hList = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | LVS_REPORT | LVS_OWNERDATA | LVS_EDITLABELS,
         0, 0, 0, 0,
         hWnd, (HMENU)(LIST_ID_BASE + tabIndex), GetModuleHandle(NULL), NULL);
 
