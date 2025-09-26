@@ -21,6 +21,9 @@
 #include <Aclapi.h>
 #include <lm.h>
 #include <activeds.h>
+#include <sddl.h>
+#include <map>
+#include <set>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -32,6 +35,30 @@
 #pragma comment(lib, "netapi32.lib")
 #pragma comment(lib, "activeds.lib")
 #pragma comment(lib, "adsiid.lib")
+
+// --- 非同期処理のためのグローバル変数と同期オブジェクト ---
+CRITICAL_SECTION g_cacheLock;
+std::map<std::wstring, std::wstring> g_sidNameCache;
+std::set<std::wstring> g_resolvingSids; // 現在解決中のSIDを管理するセット
+
+// --- ワーカースレッドとの連携用定義 ---
+#define WM_APP_OWNER_RESOLVED (WM_APP + 2)
+
+// ワーカースレッドに渡すパラメータ
+struct OwnerResolveParam {
+    HWND hNotifyWnd;
+    std::wstring sidString;
+    std::wstring accountName;
+    std::wstring domainName;
+};
+
+// ワーカースレッドからUIスレッドに返す結果
+struct OwnerResolveResult {
+    std::wstring sidString;
+    std::wstring displayName;
+    bool success;
+};
+
 
 #define IDC_TAB 1000
 #define LIST_ID_BASE 2001
@@ -94,6 +121,7 @@ enum class SizeCalculationState {
 struct FileInfo {
     WIN32_FIND_DATAW findData;
     std::wstring owner;
+    std::wstring sidString;
     ULONGLONG calculatedSize;
     SizeCalculationState sizeState;
 };
@@ -149,6 +177,7 @@ void UpdateCaptionButtonsRect(HWND hWnd);
 void DrawCaptionButtons(HDC hdc, HWND hWnd);
 void FileTimeToString(const FILETIME& ft, WCHAR* buf, size_t bufSize);
 void ApplyAddressBarFilter(ExplorerTabData* pData);
+DWORD WINAPI CalculateFolderSizeThread(LPVOID lpParam);
 
 ExplorerTabData* GetCurrentTabData() {
     int sel = TabCtrl_GetCurSel(hTab);
@@ -226,79 +255,49 @@ std::wstring GetUserDisplayNameFromAD(LPCWSTR samAccountName) {
     return displayName;
 }
 
-std::wstring GetFileOwnerW(const WCHAR* filePath) {
-    PSID pSidOwner = NULL;
-    PSECURITY_DESCRIPTOR pSD = NULL;
-    std::wstring ownerName;
 
-    DWORD dwRtn = GetNamedSecurityInfoW(
-        filePath,
-        SE_FILE_OBJECT,
-        OWNER_SECURITY_INFORMATION,
-        &pSidOwner,
-        NULL,
-        NULL,
-        NULL,
-        (LPVOID*)&pSD);
+// ワーカースレッド本体。所有者名の解決処理を行う
+DWORD WINAPI ResolveOwnerNameThread(LPVOID lpParam) {
+    auto* param = static_cast<OwnerResolveParam*>(lpParam);
+    if (!param) return 1;
 
-    if (dwRtn == ERROR_SUCCESS) {
-        WCHAR szAccountName[256];
-        WCHAR szDomainName[256];
-        DWORD dwAccountNameSize = ARRAYSIZE(szAccountName);
-        DWORD dwDomainNameSize = ARRAYSIZE(szDomainName);
-        SID_NAME_USE eUse;
+    std::wstring displayName;
+    bool success = false;
 
-        if (LookupAccountSidW(
-            NULL,
-            pSidOwner,
-            szAccountName,
-            &dwAccountNameSize,
-            szDomainName,
-            &dwDomainNameSize,
-            &eUse)) {
+    // ドメインユーザーかローカルユーザーかで処理を分岐
+    WCHAR szComputerName[MAX_COMPUTERNAME_LENGTH + 1];
+    DWORD dwSize = ARRAYSIZE(szComputerName);
+    GetComputerNameW(szComputerName, &dwSize);
 
-            if (eUse == SidTypeUser) {
-                WCHAR szComputerName[MAX_COMPUTERNAME_LENGTH + 1];
-                DWORD dwSize = ARRAYSIZE(szComputerName);
-                GetComputerNameW(szComputerName, &dwSize);
-
-                // ドメインユーザーかどうかを簡易的に判定
-                if (wcslen(szDomainName) > 0 && _wcsicmp(szDomainName, szComputerName) != 0) {
-                    // ドメインユーザーの可能性が高い -> Active Directoryに問い合わせる
-                    ownerName = GetUserDisplayNameFromAD(szAccountName);
-                }
-                else {
-                    // ローカルユーザー -> NetUserGetInfo を使う
-                    USER_INFO_2* pUserInfo = nullptr;
-                    if (NetUserGetInfo(NULL, szAccountName, 2, (LPBYTE*)&pUserInfo) == NERR_Success) {
-                        if (pUserInfo->usri2_full_name && wcslen(pUserInfo->usri2_full_name) > 0) {
-                            ownerName = pUserInfo->usri2_full_name;
-                        }
-                        else {
-                            ownerName = szAccountName;
-                        }
-                        NetApiBufferFree(pUserInfo);
-                    }
-                    else {
-                        ownerName = szAccountName;
-                    }
-                }
-            }
-            else {
-                // グループなどの場合はアカウント名をそのまま表示
-                ownerName = szAccountName;
-            }
-        }
-        else {
-            ownerName = L"N/A";
-        }
-        LocalFree(pSD);
+    if (!param->domainName.empty() && _wcsicmp(param->domainName.c_str(), szComputerName) != 0) {
+        // ドメインユーザー -> Active Directoryに問い合わせ
+        displayName = GetUserDisplayNameFromAD(param->accountName.c_str());
+        success = true;
     }
     else {
-        ownerName = L"";
+        // ローカルユーザー -> NetUserGetInfo を使う
+        USER_INFO_2* pUserInfo = nullptr;
+        if (NetUserGetInfo(NULL, param->accountName.c_str(), 2, (LPBYTE*)&pUserInfo) == NERR_Success) {
+            if (pUserInfo->usri2_full_name && wcslen(pUserInfo->usri2_full_name) > 0) {
+                displayName = pUserInfo->usri2_full_name;
+            }
+            else {
+                displayName = param->accountName;
+            }
+            NetApiBufferFree(pUserInfo);
+            success = true;
+        }
+        else {
+            displayName = param->accountName; // 失敗時はアカウント名
+        }
     }
 
-    return ownerName;
+    // UIスレッドに結果を通知
+    auto* result = new OwnerResolveResult{ param->sidString, displayName, success };
+    PostMessage(param->hNotifyWnd, WM_APP_OWNER_RESOLVED, 0, (LPARAM)result);
+
+    delete param;
+    return 0;
 }
 
 bool CompareFunction(const FileInfo& a, const FileInfo& b, ExplorerTabData* pData) {
@@ -346,8 +345,20 @@ bool CompareFunction(const FileInfo& a, const FileInfo& b, ExplorerTabData* pDat
         result = CompareFileTime(&a.findData.ftCreationTime, &b.findData.ftCreationTime);
         break;
     case 4:
-        result = a.owner.compare(b.owner);
+    {
+        std::wstring ownerA, ownerB;
+
+        EnterCriticalSection(&g_cacheLock);
+        auto itA = g_sidNameCache.find(a.sidString);
+        if (itA != g_sidNameCache.end()) ownerA = itA->second;
+
+        auto itB = g_sidNameCache.find(b.sidString);
+        if (itB != g_sidNameCache.end()) ownerB = itB->second;
+        LeaveCriticalSection(&g_cacheLock);
+
+        result = ownerA.compare(ownerB);
         break;
+    }
     }
     return pData->sortAscending ? (result < 0) : (result > 0);
 }
@@ -415,15 +426,25 @@ void ListDirectory(HWND hWnd, ExplorerTabData* pData) {
                 FileInfo info = { 0 };
                 info.findData = fd;
 
+                // SIDのみ高速に取得
                 WCHAR fullPath[MAX_PATH];
                 PathCombineW(fullPath, pData->currentPath, fd.cFileName);
-                info.owner = GetFileOwnerW(fullPath);
+
+                PSID pSidOwner = NULL;
+                PSECURITY_DESCRIPTOR pSD = NULL;
+                if (GetNamedSecurityInfoW(fullPath, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &pSidOwner, NULL, NULL, NULL, (LPVOID*)&pSD) == ERROR_SUCCESS) {
+                    LPWSTR pStringSid = NULL;
+                    if (ConvertSidToStringSidW(pSidOwner, &pStringSid)) {
+                        info.sidString = pStringSid;
+                        LocalFree(pStringSid);
+                    }
+                    LocalFree(pSD);
+                }
 
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                     info.sizeState = SizeCalculationState::NotStarted;
                     info.calculatedSize = 0;
                 }
-
                 pData->allFileData.push_back(info);
             }
         } while (FindNextFileW(hFind, &fd));
@@ -434,25 +455,70 @@ void ListDirectory(HWND hWnd, ExplorerTabData* pData) {
         return CompareFunction(a, b, pData);
         });
 
+    // --- 非同期での所有者名解決を開始 ---
+    for (auto& item : pData->allFileData) {
+        if (item.sidString.empty()) continue;
+
+        EnterCriticalSection(&g_cacheLock);
+        bool needsResolving = (g_sidNameCache.find(item.sidString) == g_sidNameCache.end() &&
+            g_resolvingSids.find(item.sidString) == g_resolvingSids.end());
+        if (needsResolving) {
+            g_resolvingSids.insert(item.sidString);
+        }
+        LeaveCriticalSection(&g_cacheLock);
+
+        if (needsResolving) {
+            PSID pSid = NULL;
+            if (ConvertStringSidToSidW(item.sidString.c_str(), &pSid)) {
+                WCHAR szAccountName[256], szDomainName[256];
+                DWORD dwAccSize = ARRAYSIZE(szAccountName), dwDomSize = ARRAYSIZE(szDomainName);
+                SID_NAME_USE use;
+                if (LookupAccountSidW(NULL, pSid, szAccountName, &dwAccSize, szDomainName, &dwDomSize, &use)) {
+                    if (use == SidTypeUser) {
+                        auto* param = new OwnerResolveParam;
+                        param->hNotifyWnd = hWnd;
+                        param->sidString = item.sidString;
+                        param->accountName = szAccountName;
+                        param->domainName = szDomainName;
+                        QueueUserWorkItem(ResolveOwnerNameThread, param, WT_EXECUTEDEFAULT);
+                    }
+                    else {
+                        // ユーザーでない(グループ等) or 解決失敗の場合はアカウント名をそのままキャッシュ
+                        EnterCriticalSection(&g_cacheLock);
+                        g_sidNameCache[item.sidString] = szAccountName;
+                        g_resolvingSids.erase(item.sidString);
+                        LeaveCriticalSection(&g_cacheLock);
+                    }
+                }
+                else {
+                    EnterCriticalSection(&g_cacheLock);
+                    g_sidNameCache[item.sidString] = L"N/A";
+                    g_resolvingSids.erase(item.sidString);
+                    LeaveCriticalSection(&g_cacheLock);
+                }
+                LocalFree(pSid);
+            }
+        }
+    }
+
+    // フォルダサイズの非同期計算
     for (auto& item : pData->allFileData) {
         if ((item.findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && wcscmp(item.findData.cFileName, L"..") != 0) {
             item.sizeState = SizeCalculationState::InProgress;
-
             auto* param = new FolderSizeParam;
             param->hNotifyWnd = hWnd;
             WCHAR fullPath[MAX_PATH];
             PathCombineW(fullPath, pData->currentPath, item.findData.cFileName);
             param->folderPath = fullPath;
-
-            CreateThread(NULL, 0, CalculateFolderSizeThread, param, 0, NULL);
+            QueueUserWorkItem(CalculateFolderSizeThread, param, WT_EXECUTEDEFAULT);
         }
     }
 
     pData->fileData = pData->allFileData;
-
     ListView_SetItemCountEx(pData->hList, pData->fileData.size(), LVSICF_NOINVALIDATEALL);
     InvalidateRect(pData->hList, NULL, TRUE);
 }
+
 
 void GetSelectedFilePathsW(ExplorerTabData* pData, std::vector<std::wstring>& paths) {
     paths.clear();
@@ -554,7 +620,19 @@ void DoCopyCut(HWND hWnd, bool isCut) {
                 tsv_text += tempBuffer;
                 tsv_text += L'\t';
 
-                tsv_text += info.owner;
+                // 所有者名をキャッシュから取得
+                if (!info.sidString.empty()) {
+                    EnterCriticalSection(&g_cacheLock);
+                    auto it = g_sidNameCache.find(info.sidString);
+                    if (it != g_sidNameCache.end()) {
+                        tsv_text += it->second;
+                    }
+                    else {
+                        tsv_text += L"取得中...";
+                    }
+                    LeaveCriticalSection(&g_cacheLock);
+                }
+
 
                 tsv_text += L"\r\n";
             }
@@ -1342,6 +1420,24 @@ void ApplyAddressBarFilter(ExplorerTabData* pData) {
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+    case WM_APP_OWNER_RESOLVED:
+    {
+        auto* result = reinterpret_cast<OwnerResolveResult*>(lParam);
+        if (result) {
+            EnterCriticalSection(&g_cacheLock);
+            g_sidNameCache[result->sidString] = result->displayName;
+            g_resolvingSids.erase(result->sidString);
+            LeaveCriticalSection(&g_cacheLock);
+
+            // 表示を更新するためにListViewを再描画
+            ExplorerTabData* pData = GetCurrentTabData();
+            if (pData) {
+                InvalidateRect(pData->hList, NULL, FALSE);
+            }
+            delete result;
+        }
+        return 0;
+    }
     case WM_APP_FOLDER_SIZE_CALCULATED:
     {
         auto* result = reinterpret_cast<FolderSizeResult*>(lParam);
@@ -1731,19 +1827,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessage(hPathEdit, EM_SETSEL, 0, -1);
             break;
         case ID_ACCELERATOR_TAB:
-            {
-                HWND hFocus = GetFocus();
-                if (hFocus == hPathEdit) SetFocus(pData->hList);
-                else if (hFocus == pData->hList) {
-                    SetFocus(hTab);
-                } else if (hFocus == hTab) {
-                    SetFocus(hAddButton);
-                } else {
-                    SetFocus(hPathEdit);
-                    SendMessage(hPathEdit, EM_SETSEL, 0, -1);
-                }
+        {
+            HWND hFocus = GetFocus();
+            if (hFocus == hPathEdit) SetFocus(pData->hList);
+            else if (hFocus == pData->hList) {
+                SetFocus(hTab);
             }
-            break;
+            else if (hFocus == hTab) {
+                SetFocus(hAddButton);
+            }
+            else {
+                SetFocus(hPathEdit);
+                SendMessage(hPathEdit, EM_SETSEL, 0, -1);
+            }
+        }
+        break;
         case ID_ACCELERATOR_REFRESH:
             ListDirectory(hWnd, pData);
             UpdateSortMark(pData);
@@ -1835,8 +1933,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                             }
                             break;
                         case 4:
-                            StringCchCopy(pItem->pszText, pItem->cchTextMax, info.owner.c_str());
+                        {
+                            if (!info.sidString.empty()) {
+                                EnterCriticalSection(&g_cacheLock);
+                                auto it = g_sidNameCache.find(info.sidString);
+                                if (it != g_sidNameCache.end()) {
+                                    // キャッシュに名前があれば表示
+                                    StringCchCopy(pItem->pszText, pItem->cchTextMax, it->second.c_str());
+                                }
+                                else {
+                                    // なければ「取得中...」を表示
+                                    StringCchCopy(pItem->pszText, pItem->cchTextMax, L"取得中...");
+                                }
+                                LeaveCriticalSection(&g_cacheLock);
+                            }
+                            else {
+                                StringCchCopy(pItem->pszText, pItem->cchTextMax, info.owner.c_str());
+                            }
                             break;
+                        }
                         }
                     }
                     if (pItem->mask & LVIF_IMAGE) {
@@ -1949,6 +2064,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         DeleteObject(hFont);
         DeleteObject((HGDIOBJ)SendMessage(hAddButton, WM_GETFONT, 0, 0));
+        DeleteCriticalSection(&g_cacheLock);
         PostQuitMessage(0);
         break;
     default:
@@ -2185,6 +2301,7 @@ void DrawCaptionButtons(HDC hdc, HWND hWnd) {
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPreInst, LPWSTR pCmdLine, int nCmdShow) {
+    InitializeCriticalSection(&g_cacheLock);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     INITCOMMONCONTROLSEX ic = { sizeof(ic), ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES };
