@@ -39,12 +39,11 @@
 // --- 非同期処理のためのグローバル変数と同期オブジェクト ---
 CRITICAL_SECTION g_cacheLock;
 std::map<std::wstring, std::wstring> g_sidNameCache;
-std::set<std::wstring> g_resolvingSids; // 現在解決中のSIDを管理するセット
+std::set<std::wstring> g_resolvingSids;
 
 // --- ワーカースレッドとの連携用定義 ---
 #define WM_APP_OWNER_RESOLVED (WM_APP + 2)
 
-// ワーカースレッドに渡すパラメータ
 struct OwnerResolveParam {
     HWND hNotifyWnd;
     std::wstring sidString;
@@ -52,7 +51,6 @@ struct OwnerResolveParam {
     std::wstring domainName;
 };
 
-// ワーカースレッドからUIスレッドに返す結果
 struct OwnerResolveResult {
     std::wstring sidString;
     std::wstring displayName;
@@ -68,14 +66,41 @@ struct OwnerResolveResult {
 #define FILTER_TIMER_ID 2
 #define WM_APP_FOLDER_SIZE_CALCULATED (WM_APP + 1)
 
-// フラットデザイン用のカラー定義
-#define FLATUI_BACKGROUND RGB(240, 240, 240)
-#define FLATUI_ACTIVE_TAB RGB(255, 255, 255)
-#define FLATUI_TEXT       RGB(0, 0, 0)
-#define FLATUI_ACCENT     RGB(0, 120, 215)
-#define FLATUI_SEPARATOR  RGB(220, 220, 220)
+// [追加] ダークモード対応のための定義
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#ifndef DWMWA_SYSTEM_BACKDROP_TYPE
+#define DWMWA_SYSTEM_BACKDROP_TYPE 38
+#endif
+#ifndef DWMSBT_MAINWINDOW
+#define DWMSBT_MAINWINDOW 2
+#endif
 
-// SDKのバージョンによっては定義されていないため、手動で定義する
+// [変更] テーマカラーを管理するグローバル変数
+bool g_isDarkMode = false;
+COLORREF g_clrBg;
+COLORREF g_clrText;
+COLORREF g_clrActiveTab;
+COLORREF g_clrAccent;
+COLORREF g_clrSeparator;
+COLORREF g_clrCloseHoverBg;
+COLORREF g_clrCloseHoverText;
+COLORREF g_clrCloseText;
+COLORREF g_clrSelection;
+COLORREF g_clrSelectionText;
+COLORREF g_clrHot; // マウスオーバー時の色
+COLORREF g_clrHeaderBg; // ヘッダー背景色
+
+static HBRUSH g_hbrBg = NULL;
+static HBRUSH g_hbrHeaderBg = NULL;
+
+// [追加] SDKのバージョンによっては定義されていないため、手動で定義する
+#ifndef HSIS_SORTEDUP
+#define HSIS_SORTEDUP 1
+#define HSIS_SORTEDDOWN 2
+#endif
+
 #ifndef TCBS_NORMAL
 #define TCBS_NORMAL 1
 #define TCBS_HOT 2
@@ -124,6 +149,7 @@ struct FileInfo {
     std::wstring sidString;
     ULONGLONG calculatedSize;
     SizeCalculationState sizeState;
+    int iIcon;
 };
 
 struct ExplorerTabData {
@@ -178,6 +204,10 @@ void DrawCaptionButtons(HDC hdc, HWND hWnd);
 void FileTimeToString(const FILETIME& ft, WCHAR* buf, size_t bufSize);
 void ApplyAddressBarFilter(ExplorerTabData* pData);
 DWORD WINAPI CalculateFolderSizeThread(LPVOID lpParam);
+void UpdateTheme(HWND hWnd);
+LRESULT CALLBACK CustomTabSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
+LRESULT CALLBACK TabCtrlSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
+
 
 ExplorerTabData* GetCurrentTabData() {
     int sel = TabCtrl_GetCurSel(hTab);
@@ -196,10 +226,8 @@ ExplorerTabData* GetTabDataFromChild(HWND hChild) {
     return nullptr;
 }
 
-// Active Directory からユーザーの表示名を取得するヘルパー関数
-// Active Directory からユーザーの表示名を取得するヘルパー関数
 std::wstring GetUserDisplayNameFromAD(LPCWSTR samAccountName) {
-    std::wstring resultName = samAccountName; // 取得失敗時のフォールバック値
+    std::wstring resultName = samAccountName;
     IADs* pRootDSE = nullptr;
     HRESULT hr = ADsGetObject(L"LDAP://rootDSE", IID_IADs, (void**)&pRootDSE);
 
@@ -227,19 +255,17 @@ std::wstring GetUserDisplayNameFromAD(LPCWSTR samAccountName) {
                 filter += samAccountName;
                 filter += L"))";
 
-                // 取得したい属性を displayName と cn の2つに増やす
                 LPCWSTR attrs[] = { L"displayName", L"cn" };
                 ADS_SEARCH_HANDLE hSearch = NULL;
                 hr = pSearch->ExecuteSearch(
                     (LPWSTR)filter.c_str(),
                     (LPWSTR*)attrs,
-                    2, // 属性の数を2に変更
+                    2,
                     &hSearch);
 
                 if (SUCCEEDED(hr)) {
                     if (SUCCEEDED(pSearch->GetFirstRow(hSearch))) {
                         ADS_SEARCH_COLUMN col;
-                        // 1. まず displayName を試す
                         if (SUCCEEDED(pSearch->GetColumn(hSearch, (LPWSTR)attrs[0], &col))) {
                             if (col.dwNumValues > 0 && col.pADsValues->dwType == ADSTYPE_CASE_IGNORE_STRING && wcslen(col.pADsValues->CaseIgnoreString) > 0) {
                                 resultName = col.pADsValues->CaseIgnoreString;
@@ -247,7 +273,6 @@ std::wstring GetUserDisplayNameFromAD(LPCWSTR samAccountName) {
                             pSearch->FreeColumn(&col);
                         }
 
-                        // 2. displayNameが取得できなかった場合、cn を試す
                         if (resultName == samAccountName) {
                             if (SUCCEEDED(pSearch->GetColumn(hSearch, (LPWSTR)attrs[1], &col))) {
                                 if (col.dwNumValues > 0 && col.pADsValues->dwType == ADSTYPE_CASE_IGNORE_STRING && wcslen(col.pADsValues->CaseIgnoreString) > 0) {
@@ -268,31 +293,25 @@ std::wstring GetUserDisplayNameFromAD(LPCWSTR samAccountName) {
     return resultName;
 }
 
-// ワーカースレッド本体。所有者名の解決処理を行う
 DWORD WINAPI ResolveOwnerNameThread(LPVOID lpParam) {
     auto* param = static_cast<OwnerResolveParam*>(lpParam);
     if (!param) return 1;
 
-    // このスレッドでCOMを使用するために初期化
     HRESULT hrCoInit = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
     std::wstring displayName;
     bool success = false;
 
     if (SUCCEEDED(hrCoInit)) {
-        // ドメインユーザーかローカルユーザーかで処理を分岐
         WCHAR szComputerName[MAX_COMPUTERNAME_LENGTH + 1];
         DWORD dwSize = ARRAYSIZE(szComputerName);
         GetComputerNameW(szComputerName, &dwSize);
 
         if (!param->domainName.empty() && _wcsicmp(param->domainName.c_str(), szComputerName) != 0) {
-            // ドメインユーザー -> Active Directoryに問い合わせ
             displayName = GetUserDisplayNameFromAD(param->accountName.c_str());
-            // ログオン名から表示名に変わっていれば成功とみなす
             success = (displayName != param->accountName);
         }
         else {
-            // ローカルユーザー -> NetUserGetInfo を使う
             USER_INFO_2* pUserInfo = nullptr;
             if (NetUserGetInfo(NULL, param->accountName.c_str(), 2, (LPBYTE*)&pUserInfo) == NERR_Success) {
                 if (pUserInfo->usri2_full_name && wcslen(pUserInfo->usri2_full_name) > 0) {
@@ -305,18 +324,15 @@ DWORD WINAPI ResolveOwnerNameThread(LPVOID lpParam) {
                 success = true;
             }
             else {
-                displayName = param->accountName; // 失敗時はアカウント名
+                displayName = param->accountName;
             }
         }
-        // このスレッドでのCOM利用を終了
         CoUninitialize();
     }
     else {
-        // COM初期化失敗時はアカウント名をそのまま返す
         displayName = param->accountName;
     }
 
-    // UIスレッドに結果を通知
     auto* result = new OwnerResolveResult{ param->sidString, displayName, success };
     PostMessage(param->hNotifyWnd, WM_APP_OWNER_RESOLVED, 0, (LPARAM)result);
 
@@ -340,23 +356,10 @@ bool CompareFunction(const FileInfo& a, const FileInfo& b, ExplorerTabData* pDat
     case 1:
     {
         ULARGE_INTEGER sizeA, sizeB;
-
-        if (isDirA) {
-            sizeA.QuadPart = a.calculatedSize;
-        }
-        else {
-            sizeA.LowPart = a.findData.nFileSizeLow;
-            sizeA.HighPart = a.findData.nFileSizeHigh;
-        }
-
-        if (isDirB) {
-            sizeB.QuadPart = b.calculatedSize;
-        }
-        else {
-            sizeB.LowPart = b.findData.nFileSizeLow;
-            sizeB.HighPart = b.findData.nFileSizeHigh;
-        }
-
+        if (isDirA) sizeA.QuadPart = a.calculatedSize;
+        else { sizeA.LowPart = a.findData.nFileSizeLow; sizeA.HighPart = a.findData.nFileSizeHigh; }
+        if (isDirB) sizeB.QuadPart = b.calculatedSize;
+        else { sizeB.LowPart = b.findData.nFileSizeLow; sizeB.HighPart = b.findData.nFileSizeHigh; }
         if (sizeA.QuadPart < sizeB.QuadPart) result = -1;
         else if (sizeA.QuadPart > sizeB.QuadPart) result = 1;
         else result = 0;
@@ -371,15 +374,12 @@ bool CompareFunction(const FileInfo& a, const FileInfo& b, ExplorerTabData* pDat
     case 4:
     {
         std::wstring ownerA, ownerB;
-
         EnterCriticalSection(&g_cacheLock);
         auto itA = g_sidNameCache.find(a.sidString);
         if (itA != g_sidNameCache.end()) ownerA = itA->second;
-
         auto itB = g_sidNameCache.find(b.sidString);
         if (itB != g_sidNameCache.end()) ownerB = itB->second;
         LeaveCriticalSection(&g_cacheLock);
-
         result = ownerA.compare(ownerB);
         break;
     }
@@ -393,9 +393,7 @@ ULONGLONG GetFolderSize(const std::wstring& folderPath) {
     std::wstring searchPath = folderPath + L"\\*";
     HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
 
-    if (hFind == INVALID_HANDLE_VALUE) {
-        return 0;
-    }
+    if (hFind == INVALID_HANDLE_VALUE) return 0;
 
     do {
         if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
@@ -418,16 +416,11 @@ ULONGLONG GetFolderSize(const std::wstring& folderPath) {
 
 DWORD WINAPI CalculateFolderSizeThread(LPVOID lpParam) {
     auto* param = static_cast<FolderSizeParam*>(lpParam);
-    if (!param) {
-        return 1;
-    }
+    if (!param) return 1;
 
     ULONGLONG size = GetFolderSize(param->folderPath);
-
     auto* result = new FolderSizeResult{ param->folderPath, size, true };
-
     PostMessage(param->hNotifyWnd, WM_APP_FOLDER_SIZE_CALCULATED, 0, (LPARAM)result);
-
     delete param;
     return 0;
 }
@@ -438,6 +431,7 @@ void ListDirectory(HWND hWnd, ExplorerTabData* pData) {
         FileInfo up_info = { 0 };
         up_info.findData.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
         StringCchCopyW(up_info.findData.cFileName, MAX_PATH, L"..");
+        up_info.iIcon = -1;
         pData->allFileData.push_back(up_info);
     }
     WIN32_FIND_DATAW fd;
@@ -449,11 +443,9 @@ void ListDirectory(HWND hWnd, ExplorerTabData* pData) {
             if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
                 FileInfo info = { 0 };
                 info.findData = fd;
-
-                // SIDのみ高速に取得
+                info.iIcon = -1;
                 WCHAR fullPath[MAX_PATH];
                 PathCombineW(fullPath, pData->currentPath, fd.cFileName);
-
                 PSID pSidOwner = NULL;
                 PSECURITY_DESCRIPTOR pSD = NULL;
                 if (GetNamedSecurityInfoW(fullPath, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &pSidOwner, NULL, NULL, NULL, (LPVOID*)&pSD) == ERROR_SUCCESS) {
@@ -464,7 +456,6 @@ void ListDirectory(HWND hWnd, ExplorerTabData* pData) {
                     }
                     LocalFree(pSD);
                 }
-
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                     info.sizeState = SizeCalculationState::NotStarted;
                     info.calculatedSize = 0;
@@ -479,16 +470,12 @@ void ListDirectory(HWND hWnd, ExplorerTabData* pData) {
         return CompareFunction(a, b, pData);
         });
 
-    // --- 非同期での所有者名解決を開始 ---
     for (auto& item : pData->allFileData) {
         if (item.sidString.empty()) continue;
-
         EnterCriticalSection(&g_cacheLock);
         bool needsResolving = (g_sidNameCache.find(item.sidString) == g_sidNameCache.end() &&
             g_resolvingSids.find(item.sidString) == g_resolvingSids.end());
-        if (needsResolving) {
-            g_resolvingSids.insert(item.sidString);
-        }
+        if (needsResolving) g_resolvingSids.insert(item.sidString);
         LeaveCriticalSection(&g_cacheLock);
 
         if (needsResolving) {
@@ -499,15 +486,10 @@ void ListDirectory(HWND hWnd, ExplorerTabData* pData) {
                 SID_NAME_USE use;
                 if (LookupAccountSidW(NULL, pSid, szAccountName, &dwAccSize, szDomainName, &dwDomSize, &use)) {
                     if (use == SidTypeUser) {
-                        auto* param = new OwnerResolveParam;
-                        param->hNotifyWnd = hWnd;
-                        param->sidString = item.sidString;
-                        param->accountName = szAccountName;
-                        param->domainName = szDomainName;
+                        auto* param = new OwnerResolveParam{ hWnd, item.sidString, szAccountName, szDomainName };
                         QueueUserWorkItem(ResolveOwnerNameThread, param, WT_EXECUTEDEFAULT);
                     }
                     else {
-                        // ユーザーでない(グループ等) or 解決失敗の場合はアカウント名をそのままキャッシュ
                         EnterCriticalSection(&g_cacheLock);
                         g_sidNameCache[item.sidString] = szAccountName;
                         g_resolvingSids.erase(item.sidString);
@@ -525,7 +507,6 @@ void ListDirectory(HWND hWnd, ExplorerTabData* pData) {
         }
     }
 
-    // フォルダサイズの非同期計算
     for (auto& item : pData->allFileData) {
         if ((item.findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && wcscmp(item.findData.cFileName, L"..") != 0) {
             item.sizeState = SizeCalculationState::InProgress;
@@ -537,12 +518,10 @@ void ListDirectory(HWND hWnd, ExplorerTabData* pData) {
             QueueUserWorkItem(CalculateFolderSizeThread, param, WT_EXECUTEDEFAULT);
         }
     }
-
     pData->fileData = pData->allFileData;
     ListView_SetItemCountEx(pData->hList, pData->fileData.size(), LVSICF_NOINVALIDATEALL);
     InvalidateRect(pData->hList, NULL, TRUE);
 }
-
 
 void GetSelectedFilePathsW(ExplorerTabData* pData, std::vector<std::wstring>& paths) {
     paths.clear();
@@ -613,17 +592,14 @@ void DoCopyCut(HWND hWnd, bool isCut) {
                     if (wcscmp(fd.cFileName, L"..") != 0) {
                         switch (info.sizeState) {
                         case SizeCalculationState::Completed:
-                            // 計算完了：計算済みサイズをフォーマットして追加
                             StrFormatByteSizeW(info.calculatedSize, tempBuffer, ARRAYSIZE(tempBuffer));
                             tsv_text += tempBuffer;
                             break;
                         case SizeCalculationState::InProgress:
                         case SizeCalculationState::NotStarted:
-                            // 計測中
                             tsv_text += L"計測中...";
                             break;
                         case SizeCalculationState::Error:
-                            // エラー
                             tsv_text += L"アクセス不可";
                             break;
                         }
@@ -644,7 +620,6 @@ void DoCopyCut(HWND hWnd, bool isCut) {
                 tsv_text += tempBuffer;
                 tsv_text += L'\t';
 
-                // 所有者名をキャッシュから取得
                 if (!info.sidString.empty()) {
                     EnterCriticalSection(&g_cacheLock);
                     auto it = g_sidNameCache.find(info.sidString);
@@ -656,7 +631,6 @@ void DoCopyCut(HWND hWnd, bool isCut) {
                     }
                     LeaveCriticalSection(&g_cacheLock);
                 }
-
 
                 tsv_text += L"\r\n";
             }
@@ -841,7 +815,6 @@ void ShowContextMenu(HWND hWnd, ExplorerTabData* pData, int iItem, POINT pt) {
                     cmi.lpVerb = MAKEINTRESOURCEA(idCmd - 1);
                     cmi.nShow = SW_SHOWNORMAL;
                     pContextMenu->InvokeCommand(&cmi);
-                    // [変更] 名前の変更などの操作後にリストを更新する
                     ListDirectory(hWnd, pData);
                 }
             }
@@ -1031,13 +1004,12 @@ LRESULT CALLBACK PathEditSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARA
     return DefSubclassProc(hWnd, uMsg, wParam, lParam);
 }
 
-LRESULT CALLBACK TabSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+LRESULT CALLBACK CustomTabSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
     static bool bTracking = false;
     static bool g_isDragging = false;
     static int g_draggedTab = -1;
     static POINT g_ptDragStart;
-
     static int g_markIndex = -1;
     static BOOL g_markAfter = FALSE;
 
@@ -1053,7 +1025,6 @@ LRESULT CALLBACK TabSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
 
             if (!(isAtStart || isAtEnd)) {
                 HDC hdc = GetDC(hWnd);
-
                 int x;
                 RECT rcCurrent;
                 TabCtrl_GetItemRect(hWnd, g_markIndex, &rcCurrent);
@@ -1082,7 +1053,7 @@ LRESULT CALLBACK TabSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
 
                 LOGBRUSH lb;
                 lb.lbStyle = BS_SOLID;
-                lb.lbColor = RGB(0, 0, 0);
+                lb.lbColor = g_clrText;
                 HPEN hPen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_SQUARE, 3, &lb, 0, NULL);
 
                 HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
@@ -1324,7 +1295,7 @@ LRESULT CALLBACK TabSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPa
         return 0;
     }
     case WM_NCDESTROY:
-        RemoveWindowSubclass(hWnd, TabSubclassProc, uIdSubclass);
+        RemoveWindowSubclass(hWnd, CustomTabSubclassProc, uIdSubclass);
         break;
     }
     return DefSubclassProc(hWnd, uMsg, wParam, lParam);
@@ -1359,36 +1330,22 @@ LRESULT CALLBACK ListSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lP
     switch (uMsg) {
     case WM_NCHITTEST:
     {
-        // Get the cursor's screen coordinates from the message parameters.
         POINT ptScreen = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-        // Get the list view's window rectangle in screen coordinates.
         RECT rcWindow;
         GetWindowRect(hWnd, &rcWindow);
 
-        // Define the width of the resizing border, consistent with the main window's handler.
         constexpr int BORDER_WIDTH = 8;
 
-        // To allow the parent window to handle resizing, we check if the cursor is
-        // over the border areas of this child window (the ListView).
-        // If it is, we return HTTRANSPARENT, which tells Windows to send the message
-        // to the underlying window (the parent). The parent's WM_NCHITTEST handler
-        // will then correctly return HTRIGHT, HTBOTTOM, HTBOTTOMRIGHT, etc.
-        // This check must be performed regardless of whether the cursor is over the
-        // list view's client area or its non-client scrollbars.
-
         if (ptScreen.x >= rcWindow.left && ptScreen.x < rcWindow.left + BORDER_WIDTH) {
-            return HTTRANSPARENT; // For left-side resizing
+            return HTTRANSPARENT;
         }
         if (ptScreen.x < rcWindow.right && ptScreen.x >= rcWindow.right - BORDER_WIDTH) {
-            return HTTRANSPARENT; // For right-side resizing
+            return HTTRANSPARENT;
         }
         if (ptScreen.y < rcWindow.bottom && ptScreen.y >= rcWindow.bottom - BORDER_WIDTH) {
-            return HTTRANSPARENT; // For bottom-side resizing
+            return HTTRANSPARENT;
         }
 
-        // If the cursor is not on a resizing border, we let the default window procedure
-        // for the ListView handle the message. This allows normal interaction with the
-        // list items and scrollbars.
         return DefSubclassProc(hWnd, uMsg, wParam, lParam);
     }
     case WM_CHAR:
@@ -1453,12 +1410,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_sidNameCache[result->sidString] = result->displayName;
             g_resolvingSids.erase(result->sidString);
             LeaveCriticalSection(&g_cacheLock);
-
-            // 表示を更新するためにListViewを再描画
             ExplorerTabData* pData = GetCurrentTabData();
-            if (pData) {
-                InvalidateRect(pData->hList, NULL, FALSE);
-            }
+            if (pData) { InvalidateRect(pData->hList, NULL, FALSE); }
             delete result;
         }
         return 0;
@@ -1468,10 +1421,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         auto* result = reinterpret_cast<FolderSizeResult*>(lParam);
         if (result) {
             ExplorerTabData* pData = GetCurrentTabData();
-            // [今回の修正] 現在のタブのフォルダパスと比較して、古い結果を無視するように修正
             if (pData && PathIsPrefixW(pData->currentPath, result->folderPath.c_str())) {
-
-                // マスターリスト(allFileData)を更新
                 for (auto& item : pData->allFileData) {
                     WCHAR fullPath[MAX_PATH];
                     PathCombineW(fullPath, pData->currentPath, item.findData.cFileName);
@@ -1481,8 +1431,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         break;
                     }
                 }
-
-                // 表示用リスト(fileData)を更新して再描画
                 for (int i = 0; i < (int)pData->fileData.size(); ++i) {
                     WCHAR fullPath[MAX_PATH];
                     PathCombineW(fullPath, pData->currentPath, pData->fileData[i].findData.cFileName);
@@ -1497,6 +1445,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             delete result;
         }
         return 0;
+    }
+    case WM_SETTINGCHANGE:
+    {
+        if (lParam != 0 && wcscmp((LPCWSTR)lParam, L"ImmersiveColorSet") == 0)
+        {
+            UpdateTheme(hWnd);
+        }
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    {
+        if ((HWND)lParam == hPathEdit) {
+            HDC hdc = (HDC)wParam;
+            SetTextColor(hdc, g_clrText);
+            SetBkColor(hdc, g_clrBg);
+            return (INT_PTR)g_hbrBg;
+        }
+        break;
     }
     case WM_NCACTIVATE:
         return 1;
@@ -1610,16 +1577,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             0, 0, 0, 0, hWnd, (HMENU)IDC_TAB, ((LPCREATESTRUCT)lParam)->hInstance, NULL);
         SendMessage(hTab, WM_SETFONT, (WPARAM)hFont, TRUE);
         TabCtrl_SetPadding(hTab, 18, 5);
-        SetWindowSubclass(hTab, TabSubclassProc, 0, 0);
+        SetWindowSubclass(hTab, CustomTabSubclassProc, 0, 0);
+        SetWindowSubclass(hTab, TabCtrlSubclassProc, 0, 0);
         hAddButton = CreateWindowW(L"BUTTON", L"+", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             0, 0, 24, 24, hWnd, (HMENU)IDC_ADD_TAB_BUTTON, ((LPCREATESTRUCT)lParam)->hInstance, NULL);
-
         hPathEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | WS_BORDER,
             0, 0, 0, 0, hWnd, (HMENU)IDC_PATH_EDIT, ((LPCREATESTRUCT)lParam)->hInstance, NULL);
         SendMessage(hPathEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
         SetWindowSubclass(hPathEdit, PathEditSubclassProc, 0, 0);
         SHAutoComplete(hPathEdit, SHACF_FILESYS_DIRS | SHACF_AUTOSUGGEST_FORCE_ON | SHACF_AUTOAPPEND_FORCE_ON);
-
         LOGFONTW lf = { 0 };
         GetObject(hFont, sizeof(lf), &lf);
         lf.lfHeight = 22;
@@ -1627,8 +1593,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         HFONT hAddButtonFont = CreateFontIndirectW(&lf);
         SendMessage(hAddButton, WM_SETFONT, (WPARAM)hAddButtonFont, TRUE);
 
-        SHFILEINFO sfi = { 0 };
-        hImgList = (HIMAGELIST)SHGetFileInfo(L"C:\\", 0, &sfi, sizeof(sfi), SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+        hImgList = ImageList_Create(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), ILC_COLOR32 | ILC_MASK, 1, 1);
+
+        UpdateTheme(hWnd);
+
         WCHAR initialPath[MAX_PATH];
         GetCurrentDirectoryW(MAX_PATH, initialPath);
         AddNewTab(hWnd, initialPath);
@@ -1682,7 +1650,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         GetClientRect(hWnd, &rcClient);
 
         RECT rcTitleBar = { 0, 0, rcClient.right, 32 };
-        HBRUSH hBrush = CreateSolidBrush(FLATUI_BACKGROUND);
+        HBRUSH hBrush = CreateSolidBrush(g_clrBg);
         FillRect(hdc, &rcTitleBar, hBrush);
         DeleteObject(hBrush);
 
@@ -1697,28 +1665,30 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HDC hdc = lpdis->hDC;
             RECT rc = lpdis->rcItem;
 
-            HBRUSH hBrush = CreateSolidBrush(FLATUI_BACKGROUND);
+            HBRUSH hBrush = CreateSolidBrush(g_clrBg);
             FillRect(hdc, &rc, hBrush);
             DeleteObject(hBrush);
 
             if (lpdis->itemState & ODS_HOTLIGHT) {
-                HBRUSH hFrameBrush = CreateSolidBrush(RGB(229, 243, 255));
+                COLORREF hoverBg = g_isDarkMode ? RGB(80, 80, 80) : RGB(229, 243, 255);
+                HBRUSH hFrameBrush = CreateSolidBrush(hoverBg);
                 FillRect(hdc, &rc, hFrameBrush);
                 DeleteObject(hFrameBrush);
-                HPEN hPen = CreatePen(PS_SOLID, 1, RGB(0, 120, 215));
+                HPEN hPen = CreatePen(PS_SOLID, 1, g_clrAccent);
                 HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
                 Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
                 SelectObject(hdc, hOldPen);
                 DeleteObject(hPen);
             }
             if (lpdis->itemState & ODS_SELECTED) {
-                HBRUSH hFrameBrush = CreateSolidBrush(RGB(204, 232, 255));
+                COLORREF pushedBg = g_isDarkMode ? RGB(100, 100, 100) : RGB(204, 232, 255);
+                HBRUSH hFrameBrush = CreateSolidBrush(pushedBg);
                 FillRect(hdc, &rc, hFrameBrush);
                 DeleteObject(hFrameBrush);
             }
 
             SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, FLATUI_TEXT);
+            SetTextColor(hdc, g_clrText);
             DrawTextW(hdc, L"+", -1, &rc, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
             return TRUE;
         }
@@ -1727,22 +1697,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             RECT rcItem = lpdis->rcItem;
             int iItem = lpdis->itemID;
             int iSel = TabCtrl_GetCurSel(hTab);
-
             bool isSelected = (iItem == iSel);
-            COLORREF bgColor = isSelected ? FLATUI_ACTIVE_TAB : FLATUI_BACKGROUND;
-
+            COLORREF bgColor = isSelected ? g_clrActiveTab : g_clrBg;
             HBRUSH hBrush = CreateSolidBrush(bgColor);
             FillRect(hdc, &rcItem, hBrush);
             DeleteObject(hBrush);
 
             if (isSelected) {
                 RECT rcIndicator = { rcItem.left, rcItem.bottom - 2, rcItem.right, rcItem.bottom };
-                HBRUSH hAccentBrush = CreateSolidBrush(FLATUI_ACCENT);
+                HBRUSH hAccentBrush = CreateSolidBrush(g_clrAccent);
                 FillRect(hdc, &rcIndicator, hAccentBrush);
                 DeleteObject(hAccentBrush);
             }
 
-            HPEN hPen = CreatePen(PS_SOLID, 1, FLATUI_SEPARATOR);
+            HPEN hPen = CreatePen(PS_SOLID, 1, g_clrSeparator);
             HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
             MoveToEx(hdc, rcItem.right - 1, rcItem.top + 4, NULL);
             LineTo(hdc, rcItem.right - 1, rcItem.bottom - 4);
@@ -1750,37 +1718,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             DeleteObject(hPen);
 
             WCHAR szText[MAX_PATH];
-            TCITEMW tci = { 0 };
-            tci.mask = TCIF_TEXT;
-            tci.pszText = szText;
-            tci.cchTextMax = ARRAYSIZE(szText);
+            TCITEMW tci = { TCIF_TEXT, 0, 0, szText, ARRAYSIZE(szText) };
             TabCtrl_GetItem(hTab, iItem, &tci);
 
-            RECT rcClose = rcItem;
-            rcClose.left = rcItem.right - 22;
-            rcClose.right = rcItem.right - 2;
-            rcClose.top = rcItem.top + (rcItem.bottom - rcItem.top - 16) / 2;
+            RECT rcClose = { rcItem.right - 22, rcItem.top + (rcItem.bottom - rcItem.top - 16) / 2, rcItem.right - 2, 0 };
             rcClose.bottom = rcClose.top + 16;
-
-            RECT rcText = rcItem;
-            rcText.right = rcClose.left;
-            rcText.left += 8;
+            RECT rcText = { rcItem.left + 8, rcItem.top, rcClose.left, rcItem.bottom };
 
             SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, FLATUI_TEXT);
+            SetTextColor(hdc, g_clrText);
             DrawTextW(hdc, szText, -1, &rcText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
             if (iItem == g_hoveredCloseButtonTab) {
-                HBRUSH hCloseBrush = CreateSolidBrush(RGB(232, 17, 35));
+                HBRUSH hCloseBrush = CreateSolidBrush(g_clrCloseHoverBg);
                 FillRect(hdc, &rcClose, hCloseBrush);
                 DeleteObject(hCloseBrush);
-                SetTextColor(hdc, RGB(255, 255, 255));
+                SetTextColor(hdc, g_clrCloseHoverText);
             }
             else {
-                SetTextColor(hdc, RGB(100, 100, 100));
+                SetTextColor(hdc, g_clrCloseText);
             }
             DrawTextW(hdc, L"✕", -1, &rcClose, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-
             return TRUE;
         }
     }
@@ -1903,6 +1861,45 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_NOTIFY:
     {
         LPNMHDR lpnmh = (LPNMHDR)lParam;
+
+        if (lpnmh->code == NM_CUSTOMDRAW) {
+            for (const auto& tab : g_tabs) {
+                if (lpnmh->hwndFrom == ListView_GetHeader(tab->hList)) {
+                    LPNMCUSTOMDRAW pnmcd = (LPNMCUSTOMDRAW)lParam;
+                    switch (pnmcd->dwDrawStage) {
+                    case CDDS_PREPAINT:
+                        return CDRF_NOTIFYITEMDRAW;
+                    case CDDS_ITEMPREPAINT: {
+                        HDC hdc = pnmcd->hdc;
+                        RECT rc = pnmcd->rc;
+                        FillRect(hdc, &rc, g_hbrHeaderBg);
+                        WCHAR szText[256];
+                        HDITEM hdi = { HDI_TEXT | HDI_FORMAT, 0, szText, NULL, 256 };
+                        Header_GetItem(pnmcd->hdr.hwndFrom, pnmcd->dwItemSpec, &hdi);
+                        SetBkMode(hdc, TRANSPARENT);
+                        SetTextColor(hdc, g_clrText);
+                        rc.left += 5;
+
+                        if (hdi.fmt & (HDF_SORTUP | HDF_SORTDOWN)) {
+                            RECT rcSort = rc;
+                            rcSort.left = rc.right - 20;
+                            HTHEME hTheme = OpenThemeData(pnmcd->hdr.hwndFrom, L"HEADER");
+                            if (hTheme) {
+                                int sortState = (hdi.fmt & HDF_SORTUP) ? HSIS_SORTEDUP : HSIS_SORTEDDOWN;
+                                DrawThemeBackground(hTheme, hdc, HP_HEADERSORTARROW, sortState, &rcSort, NULL);
+                                CloseThemeData(hTheme);
+                            }
+                            rc.right -= 20;
+                        }
+
+                        DrawText(hdc, szText, -1, &rc, DT_VCENTER | DT_SINGLELINE | DT_LEFT | DT_END_ELLIPSIS);
+                        return CDRF_SKIPDEFAULT;
+                    }
+                    }
+                }
+            }
+        }
+
         if (lpnmh->idFrom == IDC_TAB) {
             if (lpnmh->code == TCN_SELCHANGE) {
                 SwitchTab(hWnd, TabCtrl_GetCurSel(hTab));
@@ -1912,13 +1909,40 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ExplorerTabData* pData = GetTabDataFromChild(lpnmh->hwndFrom);
             if (pData) {
                 switch (lpnmh->code) {
+                case NM_CUSTOMDRAW:
+                {
+                    LPNMLVCUSTOMDRAW lplvcd = (LPNMLVCUSTOMDRAW)lParam;
+                    switch (lplvcd->nmcd.dwDrawStage)
+                    {
+                    case CDDS_PREPAINT:
+                        return CDRF_NOTIFYITEMDRAW;
+
+                    case CDDS_ITEMPREPAINT:
+                        if (lplvcd->nmcd.uItemState & CDIS_SELECTED) {
+                            lplvcd->clrText = g_clrSelectionText;
+                            lplvcd->clrTextBk = g_clrSelection;
+                        }
+                        else if (lplvcd->nmcd.uItemState & CDIS_HOT) {
+                            lplvcd->clrText = g_clrText;
+                            lplvcd->clrTextBk = g_clrHot;
+                        }
+                        else {
+                            lplvcd->clrText = g_clrText;
+                            lplvcd->clrTextBk = g_clrBg;
+                        }
+                        return CDRF_DODEFAULT;
+                    }
+                }
+                break;
                 case LVN_GETDISPINFO:
                 {
                     NMLVDISPINFO* plvdi = (NMLVDISPINFO*)lParam;
                     LVITEM* pItem = &(plvdi->item);
                     if (pItem->iItem >= (int)pData->fileData.size()) break;
-                    const FileInfo& info = pData->fileData[pItem->iItem];
+
+                    FileInfo& info = pData->fileData[pItem->iItem];
                     const WIN32_FIND_DATAW& fd = info.findData;
+
                     if (pItem->mask & LVIF_TEXT) {
                         switch (pItem->iSubItem) {
                         case 0: StringCchCopy(pItem->pszText, pItem->cchTextMax, fd.cFileName); break;
@@ -1963,11 +1987,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                 EnterCriticalSection(&g_cacheLock);
                                 auto it = g_sidNameCache.find(info.sidString);
                                 if (it != g_sidNameCache.end()) {
-                                    // キャッシュに名前があれば表示
                                     StringCchCopy(pItem->pszText, pItem->cchTextMax, it->second.c_str());
                                 }
                                 else {
-                                    // なければ「取得中...」を表示
                                     StringCchCopy(pItem->pszText, pItem->cchTextMax, L"取得中...");
                                 }
                                 LeaveCriticalSection(&g_cacheLock);
@@ -1980,37 +2002,44 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         }
                     }
                     if (pItem->mask & LVIF_IMAGE) {
-                        WCHAR fullpath[MAX_PATH];
-                        PathCombineW(fullpath, pData->currentPath, fd.cFileName);
-                        SHFILEINFO sfi = { 0 };
-                        SHGetFileInfo(fullpath, fd.dwFileAttributes, &sfi, sizeof(sfi), SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
-                        pItem->iImage = sfi.iIcon;
+                        if (info.iIcon == -1) {
+                            WCHAR fullpath[MAX_PATH];
+                            PathCombineW(fullpath, pData->currentPath, fd.cFileName);
+                            SHFILEINFO sfi = { 0 };
+                            SHGetFileInfoW(fullpath, fd.dwFileAttributes, &sfi, sizeof(sfi), SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+
+                            auto it = std::find_if(pData->allFileData.begin(), pData->allFileData.end(),
+                                [&](const FileInfo& master_info) {
+                                    return wcscmp(master_info.findData.cFileName, info.findData.cFileName) == 0;
+                                });
+
+                            int newIconIndex = ImageList_ReplaceIcon(hImgList, -1, sfi.hIcon);
+                            if (it != pData->allFileData.end()) {
+                                it->iIcon = newIconIndex;
+                            }
+                            info.iIcon = newIconIndex;
+                            DestroyIcon(sfi.hIcon);
+                        }
+                        pItem->iImage = info.iIcon;
                     }
                 }
                 break;
-                // [追加] 名前の変更完了通知の処理
                 case LVN_ENDLABELEDITW:
                 {
                     NMLVDISPINFO* pdi = (NMLVDISPINFO*)lParam;
-                    // pdi->item.pszText が NULL の場合はユーザーがEscキーでキャンセルしたことを示す
                     if (pdi->item.pszText != NULL && pdi->item.iItem != -1)
                     {
-                        // 元のファイル情報を取得
                         const FileInfo& info = pData->fileData[pdi->item.iItem];
 
-                        // 古いパスと新しいパスを構築
                         WCHAR oldPath[MAX_PATH];
                         WCHAR newPath[MAX_PATH];
                         PathCombineW(oldPath, pData->currentPath, info.findData.cFileName);
                         PathCombineW(newPath, pData->currentPath, pdi->item.pszText);
 
-                        // 名前の変更を実行
                         if (MoveFileW(oldPath, newPath))
                         {
                             std::wstring newNameStr = pdi->item.pszText;
-                            // 成功したらディレクトリを再読み込み
                             ListDirectory(hWnd, pData);
-                            // 名前変更後のアイテムを再選択する
                             for (size_t i = 0; i < pData->fileData.size(); ++i) {
                                 if (wcscmp(pData->fileData[i].findData.cFileName, newNameStr.c_str()) == 0) {
                                     ListView_SetItemState(pData->hList, (int)i, LVIS_FOCUSED | LVIS_SELECTED, LVIS_FOCUSED | LVIS_SELECTED);
@@ -2021,13 +2050,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         }
                         else
                         {
-                            // 失敗したらエラーメッセージを表示
                             MessageBoxW(hWnd, L"名前の変更に失敗しました。\nファイルが開かれているか、同じ名前のファイルが既に存在する可能性があります。", L"エラー", MB_OK | MB_ICONERROR);
-                            return FALSE; // ラベルの変更を拒否
+                            return FALSE;
                         }
-                        return TRUE; // ラベルの変更を許可
+                        return TRUE;
                     }
-                    return FALSE; // キャンセルされたので変更を拒否
+                    return FALSE;
                 }
                 break;
                 case LVN_COLUMNCLICK:
@@ -2042,17 +2070,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         pData->sortAscending = true;
                     }
 
-                    // マスターリストと表示用リストの両方をソートします
                     auto sort_predicate = [&](const FileInfo& a, const FileInfo& b) {
                         return CompareFunction(a, b, pData);
                         };
                     std::sort(pData->allFileData.begin(), pData->allFileData.end(), sort_predicate);
                     std::sort(pData->fileData.begin(), pData->fileData.end(), sort_predicate);
 
-                    // ソートマーク（▲▼）を更新します
                     UpdateSortMark(pData);
 
-                    // リストビューを再描画して変更を反映させます
                     InvalidateRect(pData->hList, NULL, TRUE);
                 }
                 break;
@@ -2069,12 +2094,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     case VK_DELETE:
                         DoDelete(hWnd, GetKeyState(VK_SHIFT) & 0x8000);
                         break;
-                        // [追加] F2キーで名前の変更を開始
                     case VK_F2:
                     {
                         int sel = ListView_GetNextItem(pData->hList, -1, LVNI_SELECTED | LVNI_FOCUSED);
                         if (sel != -1) {
-                            // ".." の名前は変更させない
                             if (wcscmp(pData->fileData[sel].findData.cFileName, L"..") != 0) {
                                 ListView_EditLabel(pData->hList, sel);
                             }
@@ -2138,6 +2161,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     break;
     case WM_DESTROY:
+        if (g_hbrBg) DeleteObject(g_hbrBg);
+        if (g_hbrHeaderBg) DeleteObject(g_hbrHeaderBg);
+        if (hImgList) ImageList_Destroy(hImgList);
         for (const auto& tab : g_tabs) {
             if (tab->searchTimerId) KillTimer(hWnd, tab->searchTimerId);
         }
@@ -2164,20 +2190,23 @@ void AddNewTab(HWND hWnd, LPCWSTR initialPath) {
 
     int tabIndex = (int)g_tabs.size();
 
-    // [変更] LVS_EDITLABELS スタイルを追加して、アイテム名のインプレース編集を有効にする
     pData->hList = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | LVS_REPORT | LVS_OWNERDATA | LVS_EDITLABELS,
         0, 0, 0, 0,
         hWnd, (HMENU)(LIST_ID_BASE + tabIndex), GetModuleHandle(NULL), NULL);
 
     if (!pData->hList) return;
 
-    SetWindowTheme(pData->hList, L"Explorer", NULL);
+    SetWindowTheme(pData->hList, L"", L"");
+    HWND hHeader = ListView_GetHeader(pData->hList);
+    if (hHeader) SetWindowTheme(hHeader, L"", L"");
 
     SetWindowSubclass(pData->hList, ListSubclassProc, 0, (DWORD_PTR)pData.get());
 
     SendMessage(pData->hList, WM_SETFONT, (WPARAM)hFont, TRUE);
-    ListView_SetExtendedListViewStyle(pData->hList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+    ListView_SetExtendedListViewStyle(pData->hList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_AUTOSIZECOLUMNS);
     ListView_SetImageList(pData->hList, hImgList, LVSIL_SMALL);
+    ListView_SetBkColor(pData->hList, g_clrBg);
+    ListView_SetTextColor(pData->hList, g_clrText);
 
     LVCOLUMNW lvc = { LVCF_TEXT | LVCF_WIDTH | LVCF_FMT };
     lvc.fmt = LVCFMT_LEFT; lvc.cx = 250; lvc.pszText = (LPWSTR)L"名前"; ListView_InsertColumn(pData->hList, 0, &lvc);
@@ -2242,7 +2271,6 @@ void UpdateLayout(HWND hWnd) {
     GetClientRect(hWnd, &rcClient);
 
     constexpr int TITLEBAR_HEIGHT = 32;
-
     constexpr int PATH_EDIT_WIDTH = 250;
     constexpr int PATH_EDIT_MARGIN = 4;
     constexpr int ADD_BUTTON_WIDTH = 22;
@@ -2253,16 +2281,13 @@ void UpdateLayout(HWND hWnd) {
     int tabHeight = -rcAdjust.top;
 
     int tabY = TITLEBAR_HEIGHT - tabHeight;
-
     int pathEditHeight = 24;
     int pathEditY = (TITLEBAR_HEIGHT - pathEditHeight) / 2;
     int addButtonY = (TITLEBAR_HEIGHT - ADD_BUTTON_WIDTH) / 2;
 
     int rightBoundary = g_rcMinButton.left;
-
     int pathEditX = rightBoundary - PATH_EDIT_MARGIN - PATH_EDIT_WIDTH;
     int addButtonX = pathEditX - ADD_BUTTON_MARGIN - ADD_BUTTON_WIDTH;
-
     int tabWidth = addButtonX;
 
     if (pathEditX < 0) pathEditX = 0;
@@ -2295,20 +2320,9 @@ void UpdateCaptionButtonsRect(HWND hWnd) {
     constexpr int BTN_WIDTH = 47;
     constexpr int BTN_HEIGHT = 32;
 
-    g_rcCloseButton.top = 0;
-    g_rcCloseButton.bottom = BTN_HEIGHT;
-    g_rcCloseButton.right = rcClient.right;
-    g_rcCloseButton.left = rcClient.right - BTN_WIDTH;
-
-    g_rcMaxButton.top = 0;
-    g_rcMaxButton.bottom = BTN_HEIGHT;
-    g_rcMaxButton.right = g_rcCloseButton.left;
-    g_rcMaxButton.left = g_rcCloseButton.left - BTN_WIDTH;
-
-    g_rcMinButton.top = 0;
-    g_rcMinButton.bottom = BTN_HEIGHT;
-    g_rcMinButton.right = g_rcMaxButton.left;
-    g_rcMinButton.left = g_rcMaxButton.left - BTN_WIDTH;
+    g_rcCloseButton = { rcClient.right - BTN_WIDTH, 0, rcClient.right, BTN_HEIGHT };
+    g_rcMaxButton = { g_rcCloseButton.left - BTN_WIDTH, 0, g_rcCloseButton.left, BTN_HEIGHT };
+    g_rcMinButton = { g_rcMaxButton.left - BTN_WIDTH, 0, g_rcMaxButton.left, BTN_HEIGHT };
 }
 
 void DrawCaptionButtons(HDC hdc, HWND hWnd) {
@@ -2318,66 +2332,126 @@ void DrawCaptionButtons(HDC hdc, HWND hWnd) {
         BOOL bActive = (GetActiveWindow() == hWnd);
 
         iState = MINBS_NORMAL;
-        if (!bActive) {
-            iState = MINBS_INACTIVE;
-        }
-        else {
-            if (g_pressedButton == CaptionButtonState::Min && g_hoveredButton == CaptionButtonState::Min) {
-                iState = MINBS_PUSHED;
-            }
-            else if (g_hoveredButton == CaptionButtonState::Min) {
-                iState = MINBS_HOT;
-            }
-        }
+        if (!bActive) iState = MINBS_INACTIVE;
+        else if (g_pressedButton == CaptionButtonState::Min && g_hoveredButton == CaptionButtonState::Min) iState = MINBS_PUSHED;
+        else if (g_hoveredButton == CaptionButtonState::Min) iState = MINBS_HOT;
         DrawThemeBackground(hTheme, hdc, WP_MINBUTTON, iState, &g_rcMinButton, NULL);
 
         if (IsZoomed(hWnd)) {
             iState = RBS_NORMAL;
-            if (!bActive) {
-                iState = RBS_INACTIVE;
-            }
-            else {
-                if (g_pressedButton == CaptionButtonState::Max && g_hoveredButton == CaptionButtonState::Max) {
-                    iState = RBS_PUSHED;
-                }
-                else if (g_hoveredButton == CaptionButtonState::Max) {
-                    iState = RBS_HOT;
-                }
-            }
+            if (!bActive) iState = RBS_INACTIVE;
+            else if (g_pressedButton == CaptionButtonState::Max && g_hoveredButton == CaptionButtonState::Max) iState = RBS_PUSHED;
+            else if (g_hoveredButton == CaptionButtonState::Max) iState = RBS_HOT;
             DrawThemeBackground(hTheme, hdc, WP_RESTOREBUTTON, iState, &g_rcMaxButton, NULL);
         }
         else {
             iState = MAXBS_NORMAL;
-            if (!bActive) {
-                iState = MAXBS_INACTIVE;
-            }
-            else {
-                if (g_pressedButton == CaptionButtonState::Max && g_hoveredButton == CaptionButtonState::Max) {
-                    iState = MAXBS_PUSHED;
-                }
-                else if (g_hoveredButton == CaptionButtonState::Max) {
-                    iState = MAXBS_HOT;
-                }
-            }
+            if (!bActive) iState = MAXBS_INACTIVE;
+            else if (g_pressedButton == CaptionButtonState::Max && g_hoveredButton == CaptionButtonState::Max) iState = MAXBS_PUSHED;
+            else if (g_hoveredButton == CaptionButtonState::Max) iState = MAXBS_HOT;
             DrawThemeBackground(hTheme, hdc, WP_MAXBUTTON, iState, &g_rcMaxButton, NULL);
         }
 
         iState = CBS_NORMAL;
-        if (!bActive) {
-            iState = CBS_INACTIVE;
-        }
-        else {
-            if (g_pressedButton == CaptionButtonState::Close && g_hoveredButton == CaptionButtonState::Close) {
-                iState = CBS_PUSHED;
-            }
-            else if (g_hoveredButton == CaptionButtonState::Close) {
-                iState = CBS_HOT;
-            }
-        }
+        if (!bActive) iState = CBS_INACTIVE;
+        else if (g_pressedButton == CaptionButtonState::Close && g_hoveredButton == CaptionButtonState::Close) iState = CBS_PUSHED;
+        else if (g_hoveredButton == CaptionButtonState::Close) iState = CBS_HOT;
         DrawThemeBackground(hTheme, hdc, WP_CLOSEBUTTON, iState, &g_rcCloseButton, NULL);
 
         CloseThemeData(hTheme);
     }
+}
+
+bool ShouldAppsUseDarkMode()
+{
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", 0, KEY_READ, &hKey) == ERROR_SUCCESS)
+    {
+        DWORD dwValue = 1;
+        DWORD dwSize = sizeof(dwValue);
+        if (RegQueryValueExW(hKey, L"AppsUseLightTheme", NULL, NULL, (LPBYTE)&dwValue, &dwSize) == ERROR_SUCCESS)
+        {
+            RegCloseKey(hKey);
+            return dwValue == 0;
+        }
+        RegCloseKey(hKey);
+    }
+    return false;
+}
+
+void UpdateTheme(HWND hWnd)
+{
+    g_isDarkMode = ShouldAppsUseDarkMode();
+
+    BOOL useDarkMode = g_isDarkMode;
+    DwmSetWindowAttribute(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &useDarkMode, sizeof(useDarkMode));
+
+    int backdropType = DWMSBT_MAINWINDOW;
+    DwmSetWindowAttribute(hWnd, DWMWA_SYSTEM_BACKDROP_TYPE, &backdropType, sizeof(backdropType));
+
+    if (g_isDarkMode) {
+        g_clrBg = RGB(32, 32, 32);
+        g_clrText = RGB(255, 255, 255);
+        g_clrActiveTab = RGB(45, 45, 45);
+        g_clrAccent = RGB(10, 132, 255);
+        g_clrSeparator = RGB(60, 60, 60);
+        g_clrCloseHoverBg = RGB(232, 17, 35);
+        g_clrCloseHoverText = RGB(255, 255, 255);
+        g_clrCloseText = RGB(200, 200, 200);
+        g_clrSelection = RGB(50, 70, 95);
+        g_clrSelectionText = RGB(255, 255, 255);
+        g_clrHot = RGB(55, 55, 55);
+        g_clrHeaderBg = RGB(45, 45, 45);
+    }
+    else {
+        g_clrBg = RGB(240, 240, 240);
+        g_clrText = RGB(0, 0, 0);
+        g_clrActiveTab = RGB(255, 255, 255);
+        g_clrAccent = RGB(0, 120, 215);
+        g_clrSeparator = RGB(220, 220, 220);
+        g_clrCloseHoverBg = RGB(232, 17, 35);
+        g_clrCloseHoverText = RGB(255, 255, 255);
+        g_clrCloseText = RGB(100, 100, 100);
+        g_clrSelection = RGB(204, 232, 255);
+        g_clrSelectionText = RGB(0, 0, 0);
+        g_clrHot = RGB(229, 243, 255);
+        g_clrHeaderBg = RGB(240, 240, 240);
+    }
+
+    if (g_hbrBg) DeleteObject(g_hbrBg);
+    g_hbrBg = CreateSolidBrush(g_clrBg);
+    if (g_hbrHeaderBg) DeleteObject(g_hbrHeaderBg);
+    g_hbrHeaderBg = CreateSolidBrush(g_clrHeaderBg);
+
+    SetWindowTheme(hPathEdit, L"", L"");
+    for (const auto& tab : g_tabs) {
+        if (tab && tab->hList) {
+            HWND hHeader = ListView_GetHeader(tab->hList);
+            SetWindowTheme(tab->hList, L"", L"");
+            if (hHeader) SetWindowTheme(hHeader, L"", L"");
+            ListView_SetBkColor(tab->hList, g_clrBg);
+            ListView_SetTextColor(tab->hList, g_clrText);
+        }
+    }
+
+    RedrawWindow(hWnd, NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+}
+
+// [追加] Tabコントロールの背景を描画するためのサブクラスプロシージャ
+LRESULT CALLBACK TabCtrlSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
+    switch (uMsg) {
+    case WM_ERASEBKGND: {
+        HDC hdc = (HDC)wParam;
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+        FillRect(hdc, &rc, g_hbrBg);
+        return 1;
+    }
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hWnd, TabCtrlSubclassProc, uIdSubclass);
+        break;
+    }
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPreInst, LPWSTR pCmdLine, int nCmdShow) {
@@ -2389,18 +2463,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPreInst, LPWSTR pCmdLine, in
     MSG msg;
     WNDCLASSW wndclass = {
         CS_HREDRAW | CS_VREDRAW,
-        WndProc,
-        0,0,
-        hInstance,
+        WndProc, 0, 0, hInstance,
         LoadIcon(hInstance, MAKEINTRESOURCE(IDI_ICON1)),
-        LoadCursor(0,IDC_ARROW),
-        0,
-        0,
-        szClassName
+        LoadCursor(0, IDC_ARROW),
+        0, 0, szClassName
     };
     RegisterClassW(&wndclass);
-    HWND hWnd = CreateWindowEx(0,
-        szClassName, L"fai",
+    HWND hWnd = CreateWindowEx(0, szClassName, L"fai",
         WS_POPUP | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CLIPCHILDREN,
         CW_USEDEFAULT, 0, 900, 600,
         0, 0, hInstance, 0);
