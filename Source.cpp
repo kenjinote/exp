@@ -20,6 +20,7 @@
 #include <vssym32.h>
 #include <Aclapi.h>
 #include <lm.h>
+#include <activeds.h>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -29,6 +30,8 @@
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "netapi32.lib")
+#pragma comment(lib, "activeds.lib")
+#pragma comment(lib, "adsiid.lib")
 
 #define IDC_TAB 1000
 #define LIST_ID_BASE 2001
@@ -164,6 +167,65 @@ ExplorerTabData* GetTabDataFromChild(HWND hChild) {
     return nullptr;
 }
 
+// Active Directory からユーザーの表示名を取得するヘルパー関数
+std::wstring GetUserDisplayNameFromAD(LPCWSTR samAccountName) {
+    std::wstring displayName = samAccountName; // 取得失敗時のフォールバック値
+    IADs* pRootDSE = nullptr;
+    HRESULT hr = ADsGetObject(L"LDAP://rootDSE", IID_IADs, (void**)&pRootDSE);
+
+    if (SUCCEEDED(hr)) {
+        VARIANT varNamingContext;
+        VariantInit(&varNamingContext);
+
+        BSTR bstrPropName = SysAllocString(L"defaultNamingContext");
+        if (bstrPropName) {
+            hr = pRootDSE->Get(bstrPropName, &varNamingContext);
+            SysFreeString(bstrPropName);
+        }
+        else {
+            hr = E_OUTOFMEMORY;
+        }
+
+        if (SUCCEEDED(hr) && varNamingContext.vt == VT_BSTR) {
+            std::wstring ldapPath = L"LDAP://";
+            ldapPath += varNamingContext.bstrVal;
+
+            IDirectorySearch* pSearch = nullptr;
+            hr = ADsGetObject(ldapPath.c_str(), IID_IDirectorySearch, (void**)&pSearch);
+            if (SUCCEEDED(hr)) {
+                std::wstring filter = L"(&(objectCategory=person)(objectClass=user)(sAMAccountName=";
+                filter += samAccountName;
+                filter += L"))";
+
+                LPCWSTR attrs[] = { L"displayName" };
+                ADS_SEARCH_HANDLE hSearch = NULL;
+                hr = pSearch->ExecuteSearch(
+                    (LPWSTR)filter.c_str(),
+                    (LPWSTR*)attrs,
+                    1,
+                    &hSearch);
+
+                if (SUCCEEDED(hr)) {
+                    if (SUCCEEDED(pSearch->GetFirstRow(hSearch))) {
+                        ADS_SEARCH_COLUMN col;
+                        if (SUCCEEDED(pSearch->GetColumn(hSearch, (LPWSTR)attrs[0], &col))) {
+                            if (col.dwNumValues > 0 && col.pADsValues->dwType == ADSTYPE_CASE_IGNORE_STRING) {
+                                displayName = col.pADsValues->CaseIgnoreString;
+                            }
+                            pSearch->FreeColumn(&col);
+                        }
+                    }
+                    pSearch->CloseSearchHandle(hSearch);
+                }
+                pSearch->Release();
+            }
+            VariantClear(&varNamingContext);
+        }
+        pRootDSE->Release();
+    }
+    return displayName;
+}
+
 std::wstring GetFileOwnerW(const WCHAR* filePath) {
     PSID pSidOwner = NULL;
     PSECURITY_DESCRIPTOR pSD = NULL;
@@ -195,28 +257,35 @@ std::wstring GetFileOwnerW(const WCHAR* filePath) {
             &dwDomainNameSize,
             &eUse)) {
 
-            // アカウントがユーザーの場合、フルネームの取得を試みる
             if (eUse == SidTypeUser) {
-                USER_INFO_2* pUserInfo = nullptr;
-                // ローカルユーザーとして情報の取得を試みる
-                if (NetUserGetInfo(NULL, szAccountName, 2, (LPBYTE*)&pUserInfo) == NERR_Success) {
-                    // フルネームが設定されていれば、それを使用する
-                    if (pUserInfo->usri2_full_name && wcslen(pUserInfo->usri2_full_name) > 0) {
-                        ownerName = pUserInfo->usri2_full_name;
-                    }
-                    else {
-                        // フルネームがなければアカウント名をそのまま使用
-                        ownerName = szAccountName;
-                    }
-                    NetApiBufferFree(pUserInfo);
+                WCHAR szComputerName[MAX_COMPUTERNAME_LENGTH + 1];
+                DWORD dwSize = ARRAYSIZE(szComputerName);
+                GetComputerNameW(szComputerName, &dwSize);
+
+                // ドメインユーザーかどうかを簡易的に判定
+                if (wcslen(szDomainName) > 0 && _wcsicmp(szDomainName, szComputerName) != 0) {
+                    // ドメインユーザーの可能性が高い -> Active Directoryに問い合わせる
+                    ownerName = GetUserDisplayNameFromAD(szAccountName);
                 }
                 else {
-                    // NetUserGetInfoが失敗した場合（ドメインユーザー等）はアカウント名を使用
-                    ownerName = szAccountName;
+                    // ローカルユーザー -> NetUserGetInfo を使う
+                    USER_INFO_2* pUserInfo = nullptr;
+                    if (NetUserGetInfo(NULL, szAccountName, 2, (LPBYTE*)&pUserInfo) == NERR_Success) {
+                        if (pUserInfo->usri2_full_name && wcslen(pUserInfo->usri2_full_name) > 0) {
+                            ownerName = pUserInfo->usri2_full_name;
+                        }
+                        else {
+                            ownerName = szAccountName;
+                        }
+                        NetApiBufferFree(pUserInfo);
+                    }
+                    else {
+                        ownerName = szAccountName;
+                    }
                 }
             }
             else {
-                // ユーザー以外（グループ等）の場合はアカウント名をそのまま使用
+                // グループなどの場合はアカウント名をそのまま表示
                 ownerName = szAccountName;
             }
         }
