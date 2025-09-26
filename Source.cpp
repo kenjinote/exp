@@ -2546,40 +2546,115 @@ void UpdateCaptionButtonsRect(HWND hWnd) {
 }
 
 void DrawCaptionButtons(HDC hdc, HWND hWnd) {
-    HTHEME hTheme = OpenThemeData(hWnd, L"WINDOW");
-    if (hTheme) {
-        int iState;
-        BOOL bActive = (GetActiveWindow() == hWnd);
+    // --- 現在のモードに応じて色を定義 ---
+    COLORREF clrIcon, clrBg, clrHotBg, clrPressedBg, clrCloseHotBg, clrCloseIcon;
 
-        iState = MINBS_NORMAL;
-        if (!bActive) iState = MINBS_INACTIVE;
-        else if (g_pressedButton == CaptionButtonState::Min && g_hoveredButton == CaptionButtonState::Min) iState = MINBS_PUSHED;
-        else if (g_hoveredButton == CaptionButtonState::Min) iState = MINBS_HOT;
-        DrawThemeBackground(hTheme, hdc, WP_MINBUTTON, iState, &g_rcMinButton, NULL);
-
-        if (IsZoomed(hWnd)) {
-            iState = RBS_NORMAL;
-            if (!bActive) iState = RBS_INACTIVE;
-            else if (g_pressedButton == CaptionButtonState::Max && g_hoveredButton == CaptionButtonState::Max) iState = RBS_PUSHED;
-            else if (g_hoveredButton == CaptionButtonState::Max) iState = RBS_HOT;
-            DrawThemeBackground(hTheme, hdc, WP_RESTOREBUTTON, iState, &g_rcMaxButton, NULL);
-        }
-        else {
-            iState = MAXBS_NORMAL;
-            if (!bActive) iState = MAXBS_INACTIVE;
-            else if (g_pressedButton == CaptionButtonState::Max && g_hoveredButton == CaptionButtonState::Max) iState = MAXBS_PUSHED;
-            else if (g_hoveredButton == CaptionButtonState::Max) iState = MAXBS_HOT;
-            DrawThemeBackground(hTheme, hdc, WP_MAXBUTTON, iState, &g_rcMaxButton, NULL);
-        }
-
-        iState = CBS_NORMAL;
-        if (!bActive) iState = CBS_INACTIVE;
-        else if (g_pressedButton == CaptionButtonState::Close && g_hoveredButton == CaptionButtonState::Close) iState = CBS_PUSHED;
-        else if (g_hoveredButton == CaptionButtonState::Close) iState = CBS_HOT;
-        DrawThemeBackground(hTheme, hdc, WP_CLOSEBUTTON, iState, &g_rcCloseButton, NULL);
-
-        CloseThemeData(hTheme);
+    if (g_isDarkMode) {
+        clrIcon = RGB(255, 255, 255);          // アイコン: 白
+        clrBg = g_clrBg;                       // 背景: ダークテーマの背景色
+        clrHotBg = RGB(80, 80, 80);            // ホバー時背景
+        clrPressedBg = RGB(100, 100, 100);     // 押下時背景
     }
+    else {
+        clrIcon = RGB(0, 0, 0);                // アイコン: 黒
+        clrBg = g_clrBg;                       // 背景: ライトテーマの背景色
+        clrHotBg = RGB(229, 243, 255);         // ホバー時背景 (薄い青)
+        clrPressedBg = RGB(204, 232, 255);     // 押下時背景 (少し濃い青)
+    }
+
+    // 閉じるボタンのホバー/押下色は共通
+    clrCloseHotBg = RGB(232, 17, 35);
+    clrCloseIcon = RGB(255, 255, 255); // 赤背景の上のアイコンは常に白
+
+    // ウィンドウが非アクティブの時はアイコンをグレーにする
+    if (GetActiveWindow() != hWnd) {
+        clrIcon = RGB(128, 128, 128);
+    }
+
+    // --- 共通の描画処理 ---
+    HBRUSH hBrush = NULL;
+
+    // ==================== 最小化ボタン ====================
+    COLORREF minBg = clrBg;
+    if (g_pressedButton == CaptionButtonState::Min && g_hoveredButton == CaptionButtonState::Min) minBg = clrPressedBg;
+    else if (g_hoveredButton == CaptionButtonState::Min) minBg = clrHotBg;
+
+    hBrush = CreateSolidBrush(minBg);
+    FillRect(hdc, &g_rcMinButton, hBrush);
+    DeleteObject(hBrush);
+
+    // アイコン描画 (―)
+    HPEN hPen = CreatePen(PS_SOLID, 1, clrIcon);
+    HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+    int minCenterX = g_rcMinButton.left + (g_rcMinButton.right - g_rcMinButton.left) / 2;
+    int minCenterY = g_rcMinButton.top + (g_rcMinButton.bottom - g_rcMinButton.top) / 2;
+    MoveToEx(hdc, minCenterX - 5, minCenterY, NULL);
+    LineTo(hdc, minCenterX + 5, minCenterY);
+    SelectObject(hdc, hOldPen);
+    DeleteObject(hPen);
+
+
+    // ==================== 最大化/元に戻すボタン ====================
+    COLORREF maxBg = clrBg;
+    if (g_pressedButton == CaptionButtonState::Max && g_hoveredButton == CaptionButtonState::Max) maxBg = clrPressedBg;
+    else if (g_hoveredButton == CaptionButtonState::Max) maxBg = clrHotBg;
+
+    hBrush = CreateSolidBrush(maxBg);
+    FillRect(hdc, &g_rcMaxButton, hBrush);
+    DeleteObject(hBrush);
+
+    // アイコン描画 (□ or ❐)
+    hPen = CreatePen(PS_SOLID, 1, clrIcon);
+    hOldPen = (HPEN)SelectObject(hdc, hPen);
+    int maxCenterX = g_rcMaxButton.left + (g_rcMaxButton.right - g_rcMaxButton.left) / 2;
+    int maxCenterY = g_rcMaxButton.top + (g_rcMaxButton.bottom - g_rcMaxButton.top) / 2;
+    if (IsZoomed(hWnd)) { // 元に戻すアイコン
+        Rectangle(hdc, maxCenterX - 3, maxCenterY - 5, maxCenterX + 5, maxCenterY + 3); // 奥の四角
+
+        // 手前の四角を描画するために一度背景で塗りつぶす
+        hBrush = CreateSolidBrush(maxBg);
+        SelectObject(hdc, GetStockObject(NULL_PEN)); // 枠線なし
+        SelectObject(hdc, hBrush);
+        Rectangle(hdc, maxCenterX - 5, maxCenterY - 3, maxCenterX + 3, maxCenterY + 5);
+        DeleteObject(hBrush);
+        SelectObject(hdc, hPen); // ペンを戻す
+
+        Rectangle(hdc, maxCenterX - 5, maxCenterY - 3, maxCenterX + 3, maxCenterY + 5); // 手前の四角
+    }
+    else { // 最大化アイコン
+        Rectangle(hdc, maxCenterX - 5, maxCenterY - 5, maxCenterX + 5, maxCenterY + 5);
+    }
+    SelectObject(hdc, hOldPen);
+    DeleteObject(hPen);
+
+
+    // ==================== 閉じるボタン ====================
+    COLORREF closeBg = clrBg;
+    COLORREF currentCloseIcon = clrIcon;
+    if (g_pressedButton == CaptionButtonState::Close && g_hoveredButton == CaptionButtonState::Close) {
+        closeBg = clrCloseHotBg;
+        currentCloseIcon = clrCloseIcon;
+    }
+    else if (g_hoveredButton == CaptionButtonState::Close) {
+        closeBg = clrCloseHotBg;
+        currentCloseIcon = clrCloseIcon;
+    }
+
+    hBrush = CreateSolidBrush(closeBg);
+    FillRect(hdc, &g_rcCloseButton, hBrush);
+    DeleteObject(hBrush);
+
+    // アイコン描画 (✕)
+    hPen = CreatePen(PS_SOLID, 2, currentCloseIcon); // 少し太いペン
+    hOldPen = (HPEN)SelectObject(hdc, hPen);
+    int closeCenterX = g_rcCloseButton.left + (g_rcCloseButton.right - g_rcCloseButton.left) / 2;
+    int closeCenterY = g_rcCloseButton.top + (g_rcCloseButton.bottom - g_rcCloseButton.top) / 2;
+    MoveToEx(hdc, closeCenterX - 5, closeCenterY - 5, NULL);
+    LineTo(hdc, closeCenterX + 5, closeCenterY + 5);
+    MoveToEx(hdc, closeCenterX - 5, closeCenterY + 5, NULL);
+    LineTo(hdc, closeCenterX + 5, closeCenterY - 5);
+    SelectObject(hdc, hOldPen);
+    DeleteObject(hPen);
 }
 
 bool ShouldAppsUseDarkMode()
@@ -2603,6 +2678,24 @@ void UpdateTheme(HWND hWnd)
 {
     g_isDarkMode = ShouldAppsUseDarkMode();
 
+    // --- [修正箇所 ここから] ---
+    // uxtheme.dllの序数133番の関数(AllowDarkModeForWindow)を呼び出します。
+    // これにより、DwmSetWindowAttributeでダークモードを設定した際に、
+    // DrawThemeBackgroundで描画されるキャプションボタンが正しくダークテーマで
+    // 描画されるようになります。
+    // このAPIは非公開(Undocumented)である点にご注意ください。
+    //static fnAllowDarkModeForWindow pfnAllowDarkModeForWindow = nullptr;
+    //if (pfnAllowDarkModeForWindow == nullptr) {
+    //    HMODULE hUxtheme = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    //    if (hUxtheme) {
+    //        pfnAllowDarkModeForWindow = reinterpret_cast<fnAllowDarkModeForWindow>(GetProcAddress(hUxtheme, MAKEINTRESOURCEA(133)));
+    //    }
+    //}
+    //if (pfnAllowDarkModeForWindow) {
+    //    pfnAllowDarkModeForWindow(hWnd, g_isDarkMode);
+    //}
+    // --- [修正箇所 ここまで] ---
+
     BOOL useDarkMode = g_isDarkMode;
     DwmSetWindowAttribute(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &useDarkMode, sizeof(useDarkMode));
 
@@ -2618,7 +2711,7 @@ void UpdateTheme(HWND hWnd)
         g_clrCloseHoverBg = RGB(232, 17, 35);
         g_clrCloseHoverText = RGB(255, 255, 255);
         g_clrCloseText = RGB(200, 200, 200);
-        g_clrSelection = RGB(38, 79, 120); // 変更箇所
+        g_clrSelection = RGB(38, 79, 120);
         g_clrSelectionText = RGB(255, 255, 255);
         g_clrHot = RGB(55, 55, 55);
         g_clrHeaderBg = RGB(45, 45, 45);
@@ -2675,6 +2768,18 @@ LRESULT CALLBACK TabCtrlSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPreInst, LPWSTR pCmdLine, int nCmdShow) {
+
+    enum class AppMode { Default, AllowDark, ForceDark, ForceLight, Max };
+    using fnSetPreferredAppMode = AppMode(WINAPI*)(AppMode appMode);
+
+    HMODULE hUxtheme = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (hUxtheme) {
+        auto pfnSetPreferredAppMode = reinterpret_cast<fnSetPreferredAppMode>(GetProcAddress(hUxtheme, MAKEINTRESOURCEA(135)));
+        if (pfnSetPreferredAppMode) {
+            pfnSetPreferredAppMode(AppMode::AllowDark);
+        }
+    }
+
     InitializeCriticalSection(&g_cacheLock);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
