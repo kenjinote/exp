@@ -197,8 +197,9 @@ ExplorerTabData* GetTabDataFromChild(HWND hChild) {
 }
 
 // Active Directory からユーザーの表示名を取得するヘルパー関数
+// Active Directory からユーザーの表示名を取得するヘルパー関数
 std::wstring GetUserDisplayNameFromAD(LPCWSTR samAccountName) {
-    std::wstring displayName = samAccountName; // 取得失敗時のフォールバック値
+    std::wstring resultName = samAccountName; // 取得失敗時のフォールバック値
     IADs* pRootDSE = nullptr;
     HRESULT hr = ADsGetObject(L"LDAP://rootDSE", IID_IADs, (void**)&pRootDSE);
 
@@ -226,22 +227,34 @@ std::wstring GetUserDisplayNameFromAD(LPCWSTR samAccountName) {
                 filter += samAccountName;
                 filter += L"))";
 
-                LPCWSTR attrs[] = { L"displayName" };
+                // 取得したい属性を displayName と cn の2つに増やす
+                LPCWSTR attrs[] = { L"displayName", L"cn" };
                 ADS_SEARCH_HANDLE hSearch = NULL;
                 hr = pSearch->ExecuteSearch(
                     (LPWSTR)filter.c_str(),
                     (LPWSTR*)attrs,
-                    1,
+                    2, // 属性の数を2に変更
                     &hSearch);
 
                 if (SUCCEEDED(hr)) {
                     if (SUCCEEDED(pSearch->GetFirstRow(hSearch))) {
                         ADS_SEARCH_COLUMN col;
+                        // 1. まず displayName を試す
                         if (SUCCEEDED(pSearch->GetColumn(hSearch, (LPWSTR)attrs[0], &col))) {
-                            if (col.dwNumValues > 0 && col.pADsValues->dwType == ADSTYPE_CASE_IGNORE_STRING) {
-                                displayName = col.pADsValues->CaseIgnoreString;
+                            if (col.dwNumValues > 0 && col.pADsValues->dwType == ADSTYPE_CASE_IGNORE_STRING && wcslen(col.pADsValues->CaseIgnoreString) > 0) {
+                                resultName = col.pADsValues->CaseIgnoreString;
                             }
                             pSearch->FreeColumn(&col);
+                        }
+
+                        // 2. displayNameが取得できなかった場合、cn を試す
+                        if (resultName == samAccountName) {
+                            if (SUCCEEDED(pSearch->GetColumn(hSearch, (LPWSTR)attrs[1], &col))) {
+                                if (col.dwNumValues > 0 && col.pADsValues->dwType == ADSTYPE_CASE_IGNORE_STRING && wcslen(col.pADsValues->CaseIgnoreString) > 0) {
+                                    resultName = col.pADsValues->CaseIgnoreString;
+                                }
+                                pSearch->FreeColumn(&col);
+                            }
                         }
                     }
                     pSearch->CloseSearchHandle(hSearch);
@@ -252,44 +265,55 @@ std::wstring GetUserDisplayNameFromAD(LPCWSTR samAccountName) {
         }
         pRootDSE->Release();
     }
-    return displayName;
+    return resultName;
 }
-
 
 // ワーカースレッド本体。所有者名の解決処理を行う
 DWORD WINAPI ResolveOwnerNameThread(LPVOID lpParam) {
     auto* param = static_cast<OwnerResolveParam*>(lpParam);
     if (!param) return 1;
 
+    // このスレッドでCOMを使用するために初期化
+    HRESULT hrCoInit = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
     std::wstring displayName;
     bool success = false;
 
-    // ドメインユーザーかローカルユーザーかで処理を分岐
-    WCHAR szComputerName[MAX_COMPUTERNAME_LENGTH + 1];
-    DWORD dwSize = ARRAYSIZE(szComputerName);
-    GetComputerNameW(szComputerName, &dwSize);
+    if (SUCCEEDED(hrCoInit)) {
+        // ドメインユーザーかローカルユーザーかで処理を分岐
+        WCHAR szComputerName[MAX_COMPUTERNAME_LENGTH + 1];
+        DWORD dwSize = ARRAYSIZE(szComputerName);
+        GetComputerNameW(szComputerName, &dwSize);
 
-    if (!param->domainName.empty() && _wcsicmp(param->domainName.c_str(), szComputerName) != 0) {
-        // ドメインユーザー -> Active Directoryに問い合わせ
-        displayName = GetUserDisplayNameFromAD(param->accountName.c_str());
-        success = true;
-    }
-    else {
-        // ローカルユーザー -> NetUserGetInfo を使う
-        USER_INFO_2* pUserInfo = nullptr;
-        if (NetUserGetInfo(NULL, param->accountName.c_str(), 2, (LPBYTE*)&pUserInfo) == NERR_Success) {
-            if (pUserInfo->usri2_full_name && wcslen(pUserInfo->usri2_full_name) > 0) {
-                displayName = pUserInfo->usri2_full_name;
-            }
-            else {
-                displayName = param->accountName;
-            }
-            NetApiBufferFree(pUserInfo);
-            success = true;
+        if (!param->domainName.empty() && _wcsicmp(param->domainName.c_str(), szComputerName) != 0) {
+            // ドメインユーザー -> Active Directoryに問い合わせ
+            displayName = GetUserDisplayNameFromAD(param->accountName.c_str());
+            // ログオン名から表示名に変わっていれば成功とみなす
+            success = (displayName != param->accountName);
         }
         else {
-            displayName = param->accountName; // 失敗時はアカウント名
+            // ローカルユーザー -> NetUserGetInfo を使う
+            USER_INFO_2* pUserInfo = nullptr;
+            if (NetUserGetInfo(NULL, param->accountName.c_str(), 2, (LPBYTE*)&pUserInfo) == NERR_Success) {
+                if (pUserInfo->usri2_full_name && wcslen(pUserInfo->usri2_full_name) > 0) {
+                    displayName = pUserInfo->usri2_full_name;
+                }
+                else {
+                    displayName = param->accountName;
+                }
+                NetApiBufferFree(pUserInfo);
+                success = true;
+            }
+            else {
+                displayName = param->accountName; // 失敗時はアカウント名
+            }
         }
+        // このスレッドでのCOM利用を終了
+        CoUninitialize();
+    }
+    else {
+        // COM初期化失敗時はアカウント名をそのまま返す
+        displayName = param->accountName;
     }
 
     // UIスレッドに結果を通知
