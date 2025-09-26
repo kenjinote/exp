@@ -1593,8 +1593,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         HFONT hAddButtonFont = CreateFontIndirectW(&lf);
         SendMessage(hAddButton, WM_SETFONT, (WPARAM)hAddButtonFont, TRUE);
 
-        hImgList = ImageList_Create(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), ILC_COLOR32 | ILC_MASK, 1, 1);
-
+        // --- [変更点 1] ---
+        // 独自のイメージリストを作成する代わりに、システムのイメージリストを取得します。
+        // hImgList = ImageList_Create(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), ILC_COLOR32 | ILC_MASK, 1, 1);
+        SHFILEINFO sfi = { 0 };
+        hImgList = (HIMAGELIST)SHGetFileInfoW(
+            L"dummy", // パスはダミーとして使われるだけです
+            FILE_ATTRIBUTE_NORMAL,
+            &sfi,
+            sizeof(sfi),
+            SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES
+        );
         UpdateTheme(hWnd);
 
         WCHAR initialPath[MAX_PATH];
@@ -1909,6 +1918,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ExplorerTabData* pData = GetTabDataFromChild(lpnmh->hwndFrom);
             if (pData) {
                 switch (lpnmh->code) {
+                    // in LRESULT CALLBACK WndProc(...) -> case WM_NOTIFY
+
                 case NM_CUSTOMDRAW:
                 {
                     LPNMLVCUSTOMDRAW lplvcd = (LPNMLVCUSTOMDRAW)lParam;
@@ -1918,19 +1929,89 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         return CDRF_NOTIFYITEMDRAW;
 
                     case CDDS_ITEMPREPAINT:
-                        if (lplvcd->nmcd.uItemState & CDIS_SELECTED) {
-                            lplvcd->clrText = g_clrSelectionText;
-                            lplvcd->clrTextBk = g_clrSelection;
+                        return CDRF_NOTIFYSUBITEMDRAW;
+                    case (CDDS_SUBITEM | CDDS_ITEMPREPAINT):
+                    {
+                        HDC hdc = lplvcd->nmcd.hdc;
+                        HWND hListView = lplvcd->nmcd.hdr.hwndFrom;
+                        int iItem = (int)lplvcd->nmcd.dwItemSpec;
+                        int iSubItem = lplvcd->iSubItem;
+                        UINT uItemState = lplvcd->nmcd.uItemState;
+
+                        ExplorerTabData* pData = GetTabDataFromChild(hListView);
+                        if (!pData || iItem >= (int)pData->fileData.size()) {
+                            return CDRF_DODEFAULT;
                         }
-                        else if (lplvcd->nmcd.uItemState & CDIS_HOT) {
-                            lplvcd->clrText = g_clrText;
-                            lplvcd->clrTextBk = g_clrHot;
+
+                        // 1. 全ての状態で文字色と背景色を決定する
+                        COLORREF clrText, clrTextBk;
+                        if (uItemState & CDIS_SELECTED) {
+                            clrText = g_clrSelectionText;
+                            clrTextBk = g_clrSelection;
+                        }
+                        else if (uItemState & CDIS_HOT) {
+                            clrText = g_clrText;
+                            clrTextBk = g_clrHot;
                         }
                         else {
-                            lplvcd->clrText = g_clrText;
-                            lplvcd->clrTextBk = g_clrBg;
+                            clrText = g_clrText;
+                            clrTextBk = g_clrBg;
                         }
-                        return CDRF_DODEFAULT;
+
+                        lplvcd->clrText = clrText;
+                        lplvcd->clrTextBk = clrTextBk;
+
+                        // ★★★ ここからが変更点 ★★★
+                        // FillRectによる背景描画をやめ、DrawTextに背景描画を委ねる
+                        SetBkMode(hdc, OPAQUE);
+                        SetBkColor(hdc, clrTextBk);
+                        SetTextColor(hdc, clrText);
+                        // ★★★ ここまでが変更点 ★★★
+
+                        // 手動でアイコンとテキストを描画する
+                        WCHAR szText[MAX_PATH];
+                        ListView_GetItemText(hListView, iItem, iSubItem, szText, MAX_PATH);
+
+                        if (iSubItem == 0) {
+                            // 1列目の描画（アイコン＋テキスト）
+                            // アイコンは背景を透明(TRANSPARENT)にして描画する必要があるため、一時的にBkModeを変更
+                            SetBkMode(hdc, TRANSPARENT);
+                            RECT rcIcon;
+                            ListView_GetSubItemRect(hListView, iItem, iSubItem, LVIR_ICON, &rcIcon);
+                            int iIcon = pData->fileData[iItem].iIcon;
+                            if (iIcon != -1) {
+                                ImageList_Draw(hImgList, iIcon, hdc, rcIcon.left, rcIcon.top, ILD_TRANSPARENT);
+                            }
+
+                            // テキストは再度 OPAQUE モードで描画
+                            SetBkMode(hdc, OPAQUE);
+                            RECT rcSubItem;
+                            ListView_GetSubItemRect(hListView, iItem, iSubItem, LVIR_BOUNDS, &rcSubItem);
+                            RECT rcText = rcSubItem;
+                            rcText.left = rcIcon.right + 4;
+                            // DrawTextは自身の背景をclrTextBkで塗りつぶすため、ExtTextOutでクリッピング領域を指定
+                            ExtTextOutW(hdc, 0, 0, ETO_CLIPPED, &rcSubItem, NULL, 0, NULL);
+                            DrawTextW(hdc, szText, -1, &rcText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                        }
+                        else {
+                            // 2列目以降の描画（テキストのみ）
+                            RECT rcSubItem;
+                            ListView_GetSubItemRect(hListView, iItem, iSubItem, LVIR_BOUNDS, &rcSubItem);
+                            RECT rcText = rcSubItem;
+                            rcText.left += 4;
+                            UINT uFormat = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS;
+                            LVCOLUMN lvc = { LVCF_FMT };
+                            if (ListView_GetColumn(hListView, iSubItem, &lvc) && (lvc.fmt & LVCF_FMT) == LVCFMT_RIGHT) {
+                                uFormat = DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS;
+                                rcText.right -= 4;
+                            }
+                            // DrawTextは自身の背景をclrTextBkで塗りつぶすため、ExtTextOutでクリッピング領域を指定
+                            ExtTextOutW(hdc, 0, 0, ETO_CLIPPED, &rcSubItem, NULL, 0, NULL);
+                            DrawTextW(hdc, szText, -1, &rcText, uFormat);
+                        }
+
+                        return CDRF_SKIPDEFAULT;
+                    }
                     }
                 }
                 break;
@@ -2002,23 +2083,33 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         }
                     }
                     if (pItem->mask & LVIF_IMAGE) {
+                        // --- [変更点 2] ---
+                        // アイコンがまだキャッシュされていない場合、システムイメージリストからインデックスを取得します。
                         if (info.iIcon == -1) {
                             WCHAR fullpath[MAX_PATH];
                             PathCombineW(fullpath, pData->currentPath, fd.cFileName);
                             SHFILEINFO sfi = { 0 };
-                            SHGetFileInfoW(fullpath, fd.dwFileAttributes, &sfi, sizeof(sfi), SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
 
+                            // SHGFI_SYSICONINDEX を使用して、アイコンのハンドルではなくシステムイメージリスト内のインデックスを取得します。
+                            SHGetFileInfoW(fullpath,
+                                fd.dwFileAttributes,
+                                &sfi,
+                                sizeof(sfi),
+                                SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+
+                            // アイコンのインデックスをキャッシュします。
+                            info.iIcon = sfi.iIcon;
+
+                            // allFileData の対応するアイテムも更新します。
                             auto it = std::find_if(pData->allFileData.begin(), pData->allFileData.end(),
                                 [&](const FileInfo& master_info) {
                                     return wcscmp(master_info.findData.cFileName, info.findData.cFileName) == 0;
                                 });
 
-                            int newIconIndex = ImageList_ReplaceIcon(hImgList, -1, sfi.hIcon);
                             if (it != pData->allFileData.end()) {
-                                it->iIcon = newIconIndex;
+                                it->iIcon = sfi.iIcon;
                             }
-                            info.iIcon = newIconIndex;
-                            DestroyIcon(sfi.hIcon);
+                            // hIconはSHGFI_SYSICONINDEXでは有効にならないため、DestroyIconは不要です。
                         }
                         pItem->iImage = info.iIcon;
                     }
@@ -2163,7 +2254,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DESTROY:
         if (g_hbrBg) DeleteObject(g_hbrBg);
         if (g_hbrHeaderBg) DeleteObject(g_hbrHeaderBg);
-        if (hImgList) ImageList_Destroy(hImgList);
+
+        // --- [変更点 3] ---
+        // システムのイメージリストはアプリケーションで破棄してはいけません。
+        // if (hImgList) ImageList_Destroy(hImgList);
+
         for (const auto& tab : g_tabs) {
             if (tab->searchTimerId) KillTimer(hWnd, tab->searchTimerId);
         }
@@ -2204,7 +2299,10 @@ void AddNewTab(HWND hWnd, LPCWSTR initialPath) {
 
     SendMessage(pData->hList, WM_SETFONT, (WPARAM)hFont, TRUE);
     ListView_SetExtendedListViewStyle(pData->hList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_AUTOSIZECOLUMNS);
+
+    // 取得済みのシステムイメージリストをListViewに設定します。
     ListView_SetImageList(pData->hList, hImgList, LVSIL_SMALL);
+
     ListView_SetBkColor(pData->hList, g_clrBg);
     ListView_SetTextColor(pData->hList, g_clrText);
 
@@ -2398,7 +2496,7 @@ void UpdateTheme(HWND hWnd)
         g_clrCloseHoverBg = RGB(232, 17, 35);
         g_clrCloseHoverText = RGB(255, 255, 255);
         g_clrCloseText = RGB(200, 200, 200);
-        g_clrSelection = RGB(50, 70, 95);
+        g_clrSelection = RGB(38, 79, 120); // 変更箇所
         g_clrSelectionText = RGB(255, 255, 255);
         g_clrHot = RGB(55, 55, 55);
         g_clrHeaderBg = RGB(45, 45, 45);
