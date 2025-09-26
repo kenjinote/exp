@@ -25,6 +25,22 @@
 #include <map>
 #include <set>
 
+// --- ここから追加 ---
+enum WINDOWCOMPOSITIONATTRIB
+{
+    WCA_USEDARKMODECOLORS = 26
+};
+
+struct WINDOWCOMPOSITIONATTRIBDATA
+{
+    WINDOWCOMPOSITIONATTRIB Attrib;
+    PVOID pvData;
+    SIZE_T cbData;
+};
+
+using fnSetWindowCompositionAttribute = BOOL(WINAPI*)(HWND hWnd, WINDOWCOMPOSITIONATTRIBDATA*);
+using fnAllowDarkModeForWindow = bool (WINAPI*)(HWND hWnd, bool allow);
+
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "pathcch.lib")
@@ -2411,10 +2427,10 @@ void AddNewTab(HWND hWnd, LPCWSTR initialPath) {
 
     if (!pData->hList) return;
 
-    SetWindowTheme(pData->hList, L"", L"");
+    SetWindowTheme(pData->hList, g_isDarkMode ? L"DarkMode_Explorer" : L"Explorer", NULL);
+
     HWND hHeader = ListView_GetHeader(pData->hList);
     if (hHeader) {
-        SetWindowTheme(hHeader, L"", L"");
         SetWindowSubclass(hHeader, HeaderSubclassProc, 0, 0); // この行を追加
     }
     SetWindowSubclass(pData->hList, ListSubclassProc, 0, (DWORD_PTR)pData.get());
@@ -2678,23 +2694,16 @@ void UpdateTheme(HWND hWnd)
 {
     g_isDarkMode = ShouldAppsUseDarkMode();
 
-    // --- [修正箇所 ここから] ---
-    // uxtheme.dllの序数133番の関数(AllowDarkModeForWindow)を呼び出します。
-    // これにより、DwmSetWindowAttributeでダークモードを設定した際に、
-    // DrawThemeBackgroundで描画されるキャプションボタンが正しくダークテーマで
-    // 描画されるようになります。
-    // このAPIは非公開(Undocumented)である点にご注意ください。
-    //static fnAllowDarkModeForWindow pfnAllowDarkModeForWindow = nullptr;
-    //if (pfnAllowDarkModeForWindow == nullptr) {
-    //    HMODULE hUxtheme = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    //    if (hUxtheme) {
-    //        pfnAllowDarkModeForWindow = reinterpret_cast<fnAllowDarkModeForWindow>(GetProcAddress(hUxtheme, MAKEINTRESOURCEA(133)));
-    //    }
-    //}
-    //if (pfnAllowDarkModeForWindow) {
-    //    pfnAllowDarkModeForWindow(hWnd, g_isDarkMode);
-    //}
-    // --- [修正箇所 ここまで] ---
+    // uxtheme.dllから非公開APIを取得 (一度だけロード)
+    static fnAllowDarkModeForWindow pfnAllowDarkModeForWindow = nullptr;
+    static bool api_loaded = false;
+    if (!api_loaded) {
+        HMODULE hUxtheme = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (hUxtheme) {
+            pfnAllowDarkModeForWindow = reinterpret_cast<fnAllowDarkModeForWindow>(GetProcAddress(hUxtheme, MAKEINTRESOURCEA(133)));
+        }
+        api_loaded = true; // 失敗しても再試行しない
+    }
 
     BOOL useDarkMode = g_isDarkMode;
     DwmSetWindowAttribute(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &useDarkMode, sizeof(useDarkMode));
@@ -2736,21 +2745,29 @@ void UpdateTheme(HWND hWnd)
     if (g_hbrHeaderBg) DeleteObject(g_hbrHeaderBg);
     g_hbrHeaderBg = CreateSolidBrush(g_clrHeaderBg);
 
+    // PathEditコントロールのテーマを更新
+    if (pfnAllowDarkModeForWindow) {
+        pfnAllowDarkModeForWindow(hPathEdit, g_isDarkMode);
+    }
     SetWindowTheme(hPathEdit, L"", L"");
+    SetWindowPos(hPathEdit, NULL, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
+
     for (const auto& tab : g_tabs) {
         if (tab && tab->hList) {
+            SetWindowTheme(tab->hList, g_isDarkMode ? L"DarkMode_Explorer" : L"Explorer", NULL);
+
             HWND hHeader = ListView_GetHeader(tab->hList);
-            SetWindowTheme(tab->hList, L"", L"");
             if (hHeader) SetWindowTheme(hHeader, L"", L"");
+
             ListView_SetBkColor(tab->hList, g_clrBg);
             ListView_SetTextColor(tab->hList, g_clrText);
+
+            SetWindowPos(tab->hList, NULL, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
         }
     }
-
     RedrawWindow(hWnd, NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
 }
 
-// [追加] Tabコントロールの背景を描画するためのサブクラスプロシージャ
 LRESULT CALLBACK TabCtrlSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
     switch (uMsg) {
     case WM_ERASEBKGND: {
