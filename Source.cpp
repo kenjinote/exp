@@ -41,6 +41,9 @@ CRITICAL_SECTION g_cacheLock;
 std::map<std::wstring, std::wstring> g_sidNameCache;
 std::set<std::wstring> g_resolvingSids;
 
+// ホバー状態管理用のグローバル変数（ファイルの先頭付近に追加）
+static std::map<HWND, int> g_hoveredItems;
+
 // --- ワーカースレッドとの連携用定義 ---
 #define WM_APP_OWNER_RESOLVED (WM_APP + 2)
 
@@ -207,7 +210,7 @@ DWORD WINAPI CalculateFolderSizeThread(LPVOID lpParam);
 void UpdateTheme(HWND hWnd);
 LRESULT CALLBACK CustomTabSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 LRESULT CALLBACK TabCtrlSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
-
+int CalculateNameColumnWidth(ExplorerTabData* pData);
 
 ExplorerTabData* GetCurrentTabData() {
     int sel = TabCtrl_GetCurSel(hTab);
@@ -1871,7 +1874,33 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     {
         LPNMHDR lpnmh = (LPNMHDR)lParam;
 
-        if (lpnmh->code == NM_CUSTOMDRAW) {
+        // ヘッダーの区切り線ダブルクリック処理を追加
+        if (lpnmh->code == HDN_DIVIDERDBLCLICK) {
+            LPNMHEADER pnmhdr = (LPNMHEADER)lParam;
+
+            // どのタブのリストビューかを特定
+            ExplorerTabData* pData = nullptr;
+            for (const auto& tab : g_tabs) {
+                if (ListView_GetHeader(tab->hList) == lpnmh->hwndFrom) {
+                    pData = tab.get();
+                    break;
+                }
+            }
+
+            if (pData && pnmhdr->iItem == 0) { // 名前カラム（0番目）の場合のみ処理
+                // カスタム自動サイズ調整を実行
+                int maxWidth = CalculateNameColumnWidth(pData);
+
+                // カラム幅を設定
+                LVCOLUMN lvc = { LVCF_WIDTH };
+                lvc.cx = maxWidth;
+                ListView_SetColumn(pData->hList, 0, &lvc);
+
+                // デフォルトの処理をスキップ
+                return 0;
+            }
+        }
+        else if (lpnmh->code == NM_CUSTOMDRAW) {
             for (const auto& tab : g_tabs) {
                 if (lpnmh->hwndFrom == ListView_GetHeader(tab->hList)) {
                     LPNMCUSTOMDRAW pnmcd = (LPNMCUSTOMDRAW)lParam;
@@ -1919,7 +1948,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (pData) {
                 switch (lpnmh->code) {
                     // in LRESULT CALLBACK WndProc(...) -> case WM_NOTIFY
-
                 case NM_CUSTOMDRAW:
                 {
                     LPNMLVCUSTOMDRAW lplvcd = (LPNMLVCUSTOMDRAW)lParam;
@@ -1928,14 +1956,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     case CDDS_PREPAINT:
                         return CDRF_NOTIFYITEMDRAW;
 
+                        // WM_NOTIFY -> NM_CUSTOMDRAW -> CDDS_ITEMPREPAINT内の修正部分
+
+// WM_NOTIFY -> NM_CUSTOMDRAW -> CDDS_ITEMPREPAINT内の修正部分
+
                     case CDDS_ITEMPREPAINT:
-                        return CDRF_NOTIFYSUBITEMDRAW;
-                    case (CDDS_SUBITEM | CDDS_ITEMPREPAINT):
                     {
+                        // アイテム全体の描画を制御
                         HDC hdc = lplvcd->nmcd.hdc;
                         HWND hListView = lplvcd->nmcd.hdr.hwndFrom;
                         int iItem = (int)lplvcd->nmcd.dwItemSpec;
-                        int iSubItem = lplvcd->iSubItem;
                         UINT uItemState = lplvcd->nmcd.uItemState;
 
                         ExplorerTabData* pData = GetTabDataFromChild(hListView);
@@ -1943,13 +1973,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                             return CDRF_DODEFAULT;
                         }
 
-                        // 1. 全ての状態で文字色と背景色を決定する
+                        // グローバル変数からホバー状態を取得
+                        auto it = g_hoveredItems.find(hListView);
+                        int hoveredItem = (it != g_hoveredItems.end()) ? it->second : -1;
+                        bool isHovered = (hoveredItem == iItem);
+
+                        // 背景色とテキスト色を決定
                         COLORREF clrText, clrTextBk;
                         if (uItemState & CDIS_SELECTED) {
                             clrText = g_clrSelectionText;
                             clrTextBk = g_clrSelection;
                         }
-                        else if (uItemState & CDIS_HOT) {
+                        else if (isHovered) {
                             clrText = g_clrText;
                             clrTextBk = g_clrHot;
                         }
@@ -1958,60 +1993,181 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                             clrTextBk = g_clrBg;
                         }
 
-                        lplvcd->clrText = clrText;
-                        lplvcd->clrTextBk = clrTextBk;
+                        // アイテム全体の矩形を取得
+                        RECT rcItem;
+                        ListView_GetItemRect(hListView, iItem, &rcItem, LVIR_BOUNDS);
 
-                        // ★★★ ここからが変更点 ★★★
-                        // FillRectによる背景描画をやめ、DrawTextに背景描画を委ねる
-                        SetBkMode(hdc, OPAQUE);
-                        SetBkColor(hdc, clrTextBk);
+                        // 背景を塗りつぶし
+                        HBRUSH hBrush = CreateSolidBrush(clrTextBk);
+                        FillRect(hdc, &rcItem, hBrush);
+                        DeleteObject(hBrush);
+
+                        // テキスト描画の準備
                         SetTextColor(hdc, clrText);
-                        // ★★★ ここまでが変更点 ★★★
+                        SetBkMode(hdc, TRANSPARENT);
 
-                        // 手動でアイコンとテキストを描画する
-                        WCHAR szText[MAX_PATH];
-                        ListView_GetItemText(hListView, iItem, iSubItem, szText, MAX_PATH);
+                        const FileInfo& info = pData->fileData[iItem];
+                        const WIN32_FIND_DATAW& fd = info.findData;
 
-                        if (iSubItem == 0) {
-                            // 1列目の描画（アイコン＋テキスト）
-                            // アイコンは背景を透明(TRANSPARENT)にして描画する必要があるため、一時的にBkModeを変更
-                            SetBkMode(hdc, TRANSPARENT);
-                            RECT rcIcon;
-                            ListView_GetSubItemRect(hListView, iItem, iSubItem, LVIR_ICON, &rcIcon);
-                            int iIcon = pData->fileData[iItem].iIcon;
-                            if (iIcon != -1) {
-                                ImageList_Draw(hImgList, iIcon, hdc, rcIcon.left, rcIcon.top, ILD_TRANSPARENT);
-                            }
+                        // 各サブアイテムを順次描画
+                        HWND hHeader = ListView_GetHeader(hListView);
+                        int columnCount = Header_GetItemCount(hHeader);
 
-                            // テキストは再度 OPAQUE モードで描画
-                            SetBkMode(hdc, OPAQUE);
-                            RECT rcSubItem;
-                            ListView_GetSubItemRect(hListView, iItem, iSubItem, LVIR_BOUNDS, &rcSubItem);
-                            RECT rcText = rcSubItem;
-                            rcText.left = rcIcon.right + 4;
-                            // DrawTextは自身の背景をclrTextBkで塗りつぶすため、ExtTextOutでクリッピング領域を指定
-                            ExtTextOutW(hdc, 0, 0, ETO_CLIPPED, &rcSubItem, NULL, 0, NULL);
-                            DrawTextW(hdc, szText, -1, &rcText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                        // ヘッダーから各カラムの位置を正確に取得
+                        std::vector<int> columnPositions;
+                        columnPositions.push_back(0);
+
+                        for (int i = 0; i < columnCount; i++) {
+                            RECT rcHeader;
+                            Header_GetItemRect(hHeader, i, &rcHeader);
+                            columnPositions.push_back(rcHeader.right);
                         }
-                        else {
-                            // 2列目以降の描画（テキストのみ）
-                            RECT rcSubItem;
-                            ListView_GetSubItemRect(hListView, iItem, iSubItem, LVIR_BOUNDS, &rcSubItem);
-                            RECT rcText = rcSubItem;
-                            rcText.left += 4;
-                            UINT uFormat = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS;
-                            LVCOLUMN lvc = { LVCF_FMT };
-                            if (ListView_GetColumn(hListView, iSubItem, &lvc) && (lvc.fmt & LVCF_FMT) == LVCFMT_RIGHT) {
-                                uFormat = DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS;
-                                rcText.right -= 4;
+
+                        for (int iSubItem = 0; iSubItem < columnCount; iSubItem++) {
+                            WCHAR szText[MAX_PATH] = { 0 };
+
+                            // サブアイテムごとのテキストを取得
+                            switch (iSubItem) {
+                            case 0:
+                                StringCchCopy(szText, MAX_PATH, fd.cFileName);
+                                break;
+                            case 1:
+                                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                                    if (wcscmp(fd.cFileName, L"..") == 0) {
+                                        szText[0] = L'\0';
+                                    }
+                                    else {
+                                        switch (info.sizeState) {
+                                        case SizeCalculationState::InProgress:
+                                        case SizeCalculationState::NotStarted:
+                                            StringCchCopy(szText, MAX_PATH, L"計測中...");
+                                            break;
+                                        case SizeCalculationState::Completed:
+                                            StrFormatByteSizeW(info.calculatedSize, szText, MAX_PATH);
+                                            break;
+                                        case SizeCalculationState::Error:
+                                            StringCchCopy(szText, MAX_PATH, L"アクセス不可");
+                                            break;
+                                        }
+                                    }
+                                }
+                                else {
+                                    ULARGE_INTEGER sz = { fd.nFileSizeLow, fd.nFileSizeHigh };
+                                    StrFormatByteSizeW(sz.QuadPart, szText, MAX_PATH);
+                                }
+                                break;
+                            case 2:
+                            case 3:
+                                if (wcscmp(fd.cFileName, L"..") != 0) {
+                                    const FILETIME& ft = (iSubItem == 2) ? fd.ftLastWriteTime : fd.ftCreationTime;
+                                    FileTimeToString(ft, szText, MAX_PATH);
+                                }
+                                else {
+                                    szText[0] = L'\0';
+                                }
+                                break;
+                            case 4:
+                                if (!info.sidString.empty()) {
+                                    EnterCriticalSection(&g_cacheLock);
+                                    auto it = g_sidNameCache.find(info.sidString);
+                                    if (it != g_sidNameCache.end()) {
+                                        StringCchCopy(szText, MAX_PATH, it->second.c_str());
+                                    }
+                                    else {
+                                        StringCchCopy(szText, MAX_PATH, L"取得中...");
+                                    }
+                                    LeaveCriticalSection(&g_cacheLock);
+                                }
+                                else {
+                                    StringCchCopy(szText, MAX_PATH, info.owner.c_str());
+                                }
+                                break;
                             }
-                            // DrawTextは自身の背景をclrTextBkで塗りつぶすため、ExtTextOutでクリッピング領域を指定
-                            ExtTextOutW(hdc, 0, 0, ETO_CLIPPED, &rcSubItem, NULL, 0, NULL);
-                            DrawTextW(hdc, szText, -1, &rcText, uFormat);
+
+                            // カラムの正確な矩形を計算
+                            RECT rcSubItem = rcItem;
+                            rcSubItem.left = columnPositions[iSubItem];
+                            rcSubItem.right = columnPositions[iSubItem + 1];
+
+                            // カラムごとの描画処理
+                            if (iSubItem == 0) { // 名前カラム
+                                // アイコンを描画
+                                RECT rcIcon;
+                                ListView_GetSubItemRect(hListView, iItem, iSubItem, LVIR_ICON, &rcIcon);
+
+                                // アイコンがキャッシュされていない場合は取得
+                                if (info.iIcon == -1) {
+                                    WCHAR fullpath[MAX_PATH];
+                                    PathCombineW(fullpath, pData->currentPath, fd.cFileName);
+                                    SHFILEINFO sfi = { 0 };
+                                    SHGetFileInfoW(fullpath,
+                                        fd.dwFileAttributes,
+                                        &sfi,
+                                        sizeof(sfi),
+                                        SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+
+                                    // キャッシュを更新（const_castを使用して一時的に変更）
+                                    const_cast<FileInfo&>(info).iIcon = sfi.iIcon;
+
+                                    // allFileDataの対応するアイテムも更新
+                                    auto it = std::find_if(pData->allFileData.begin(), pData->allFileData.end(),
+                                        [&](const FileInfo& master_info) {
+                                            return wcscmp(master_info.findData.cFileName, info.findData.cFileName) == 0;
+                                        });
+                                    if (it != pData->allFileData.end()) {
+                                        it->iIcon = sfi.iIcon;
+                                    }
+                                }
+
+                                int iIcon = info.iIcon;
+                                if (iIcon != -1 && hImgList) {
+                                    ImageList_Draw(hImgList, iIcon, hdc, rcIcon.left, rcIcon.top, ILD_TRANSPARENT);
+                                }
+
+                                // テキスト描画領域を正確に制限
+                                RECT rcText = rcSubItem;
+                                rcText.left = rcIcon.right + 4;
+                                rcText.right = rcSubItem.right - 4; // カラムの右端で確実に制限
+
+                                // テキストを描画（DT_END_ELLIPSISで省略記号を表示）
+                                DrawTextW(hdc, szText, -1, &rcText,
+                                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+                            }
+                            else { // その他のカラム
+                                // テキスト描画領域を計算
+                                RECT rcText = rcSubItem;
+                                rcText.left += 4;
+                                rcText.right -= 4;
+
+                                // カラムの書式を取得
+                                UINT uFormat = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
+                                LVCOLUMN lvc = { LVCF_FMT };
+                                if (ListView_GetColumn(hListView, iSubItem, &lvc)) {
+                                    if (lvc.fmt & LVCFMT_RIGHT) {
+                                        uFormat = DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
+                                    }
+                                    else if (lvc.fmt & LVCFMT_CENTER) {
+                                        uFormat = DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
+                                    }
+                                }
+
+                                // テキストを描画
+                                DrawTextW(hdc, szText, -1, &rcText, uFormat);
+                            }
+                        }
+
+                        // フォーカス矩形を描画（選択されているアイテムの場合）
+                        if ((uItemState & CDIS_SELECTED) && (uItemState & CDIS_FOCUS)) {
+                            DrawFocusRect(hdc, &rcItem);
                         }
 
                         return CDRF_SKIPDEFAULT;
                     }
+                    
+
+                    case (CDDS_SUBITEM | CDDS_ITEMPREPAINT):
+                        // サブアイテムレベルの描画は行わない（アイテムレベルで全て描画済み）
+                        return CDRF_SKIPDEFAULT;
                     }
                 }
                 break;
@@ -2582,4 +2738,50 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPreInst, LPWSTR pCmdLine, in
     }
     CoUninitialize();
     return (int)msg.wParam;
+}
+
+// 3. 関数の実装（WndProc関数の外、ファイルの最後の方に追加）
+int CalculateNameColumnWidth(ExplorerTabData* pData) {
+    if (!pData || !pData->hList) return 250; // デフォルト幅
+
+    HDC hdc = GetDC(pData->hList);
+    if (!hdc) return 250;
+
+    HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
+
+    int maxWidth = 0;
+    const int ICON_WIDTH = GetSystemMetrics(SM_CXSMICON);
+    const int MARGIN = 8; // 左右のマージン
+    const int ICON_TEXT_GAP = 4; // アイコンとテキスト間のギャップ
+
+    // ヘッダーテキストの幅も考慮
+    SIZE headerSize;
+    if (GetTextExtentPoint32W(hdc, L"名前", 2, &headerSize)) {
+        maxWidth = headerSize.cx + MARGIN * 2;
+    }
+
+    // 各ファイルのファイル名の幅を計算
+    for (const auto& fileInfo : pData->fileData) {
+        SIZE textSize;
+        int nameLen = wcslen(fileInfo.findData.cFileName);
+
+        if (GetTextExtentPoint32W(hdc, fileInfo.findData.cFileName, nameLen, &textSize)) {
+            int totalWidth = ICON_WIDTH + ICON_TEXT_GAP + textSize.cx + MARGIN * 2;
+            if (totalWidth > maxWidth) {
+                maxWidth = totalWidth;
+            }
+        }
+    }
+
+    SelectObject(hdc, hOldFont);
+    ReleaseDC(pData->hList, hdc);
+
+    // 最小幅と最大幅の制限
+    const int MIN_WIDTH = 100;
+    const int MAX_WIDTH = 500; // 最大幅を少し大きくして長いファイル名に対応
+
+    if (maxWidth < MIN_WIDTH) maxWidth = MIN_WIDTH;
+    if (maxWidth > MAX_WIDTH) maxWidth = MAX_WIDTH;
+
+    return maxWidth;
 }
