@@ -211,6 +211,7 @@ void UpdateTheme(HWND hWnd);
 LRESULT CALLBACK CustomTabSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 LRESULT CALLBACK TabCtrlSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 int CalculateNameColumnWidth(ExplorerTabData* pData);
+LRESULT CALLBACK HeaderSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
 
 ExplorerTabData* GetCurrentTabData() {
     int sel = TabCtrl_GetCurSel(hTab);
@@ -1900,43 +1901,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 return 0;
             }
         }
-        else if (lpnmh->code == NM_CUSTOMDRAW) {
-            for (const auto& tab : g_tabs) {
-                if (lpnmh->hwndFrom == ListView_GetHeader(tab->hList)) {
-                    LPNMCUSTOMDRAW pnmcd = (LPNMCUSTOMDRAW)lParam;
-                    switch (pnmcd->dwDrawStage) {
-                    case CDDS_PREPAINT:
-                        return CDRF_NOTIFYITEMDRAW;
-                    case CDDS_ITEMPREPAINT: {
-                        HDC hdc = pnmcd->hdc;
-                        RECT rc = pnmcd->rc;
-                        FillRect(hdc, &rc, g_hbrHeaderBg);
-                        WCHAR szText[256];
-                        HDITEM hdi = { HDI_TEXT | HDI_FORMAT, 0, szText, NULL, 256 };
-                        Header_GetItem(pnmcd->hdr.hwndFrom, pnmcd->dwItemSpec, &hdi);
-                        SetBkMode(hdc, TRANSPARENT);
-                        SetTextColor(hdc, g_clrText);
-                        rc.left += 5;
-
-                        if (hdi.fmt & (HDF_SORTUP | HDF_SORTDOWN)) {
-                            RECT rcSort = rc;
-                            rcSort.left = rc.right - 20;
-                            HTHEME hTheme = OpenThemeData(pnmcd->hdr.hwndFrom, L"HEADER");
-                            if (hTheme) {
-                                int sortState = (hdi.fmt & HDF_SORTUP) ? HSIS_SORTEDUP : HSIS_SORTEDDOWN;
-                                DrawThemeBackground(hTheme, hdc, HP_HEADERSORTARROW, sortState, &rcSort, NULL);
-                                CloseThemeData(hTheme);
-                            }
-                            rc.right -= 20;
-                        }
-
-                        DrawText(hdc, szText, -1, &rc, DT_VCENTER | DT_SINGLELINE | DT_LEFT | DT_END_ELLIPSIS);
-                        return CDRF_SKIPDEFAULT;
-                    }
-                    }
-                }
-            }
-        }
 
         if (lpnmh->idFrom == IDC_TAB) {
             if (lpnmh->code == TCN_SELCHANGE) {
@@ -2449,8 +2413,10 @@ void AddNewTab(HWND hWnd, LPCWSTR initialPath) {
 
     SetWindowTheme(pData->hList, L"", L"");
     HWND hHeader = ListView_GetHeader(pData->hList);
-    if (hHeader) SetWindowTheme(hHeader, L"", L"");
-
+    if (hHeader) {
+        SetWindowTheme(hHeader, L"", L"");
+        SetWindowSubclass(hHeader, HeaderSubclassProc, 0, 0); // この行を追加
+    }
     SetWindowSubclass(pData->hList, ListSubclassProc, 0, (DWORD_PTR)pData.get());
 
     SendMessage(pData->hList, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -2784,4 +2750,105 @@ int CalculateNameColumnWidth(ExplorerTabData* pData) {
     if (maxWidth > MAX_WIDTH) maxWidth = MAX_WIDTH;
 
     return maxWidth;
+}
+
+LRESULT CALLBACK HeaderSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
+{
+    switch (uMsg)
+    {
+    case WM_ERASEBKGND:
+        return 1; // ちらつきを防止するため、何もしない
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+
+        // [修正] リストビューと同じフォントを選択
+        HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
+
+        RECT rcClient;
+        GetClientRect(hWnd, &rcClient);
+
+        // ヘッダー全体の背景をテーマカラーで描画
+        FillRect(hdc, &rcClient, g_hbrHeaderBg);
+
+        int itemCount = Header_GetItemCount(hWnd);
+        for (int i = 0; i < itemCount; ++i)
+        {
+            RECT rcItem;
+            if (Header_GetItemRect(hWnd, i, &rcItem))
+            {
+                // 項目のテキストとフォーマットを取得
+                WCHAR szText[256];
+                HDITEMW hdi = { HDI_TEXT | HDI_FORMAT, 0, szText, NULL, ARRAYSIZE(szText) };
+                Header_GetItem(hWnd, i, &hdi);
+
+                // テキスト描画の準備
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, g_clrText);
+
+                RECT rcText = rcItem;
+                rcText.left += 8;
+                rcText.right -= 8;
+
+                // ソート矢印を手動で描画
+                if (hdi.fmt & (HDF_SORTUP | HDF_SORTDOWN)) {
+                    HPEN hPen = CreatePen(PS_SOLID, 1, g_clrText);
+                    HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+                    HBRUSH hBrush = CreateSolidBrush(g_clrText);
+                    HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, hBrush);
+
+                    const int arrowWidth = 8;
+                    const int arrowHeight = 4;
+                    int midX = rcText.right - arrowWidth / 2 - 4;
+                    int midY = rcItem.top + (rcItem.bottom - rcItem.top) / 2;
+
+                    POINT points[3];
+                    if (hdi.fmt & HDF_SORTUP) { // 上向き ▲
+                        points[0] = { midX, midY - (arrowHeight / 2) };
+                        points[1] = { midX - (arrowWidth / 2), midY + (arrowHeight / 2) };
+                        points[2] = { midX + (arrowWidth / 2), midY + (arrowHeight / 2) };
+                    }
+                    else { // 下向き ▼
+                        points[0] = { midX, midY + (arrowHeight / 2) };
+                        points[1] = { midX - (arrowWidth / 2), midY - (arrowHeight / 2) };
+                        points[2] = { midX + (arrowWidth / 2), midY - (arrowHeight / 2) };
+                    }
+                    Polygon(hdc, points, 3);
+
+                    SelectObject(hdc, hOldPen);
+                    DeleteObject(hPen);
+                    SelectObject(hdc, hOldBrush);
+                    DeleteObject(hBrush);
+
+                    rcText.right -= (arrowWidth + 8);
+                }
+
+                // テキストを描画
+                DrawTextW(hdc, szText, -1, &rcText, DT_VCENTER | DT_SINGLELINE | DT_LEFT | DT_END_ELLIPSIS);
+
+                // 区切り線を描画
+                HPEN hSepPen = CreatePen(PS_SOLID, 1, g_isDarkMode ? RGB(60, 60, 60) : RGB(220, 220, 220));
+                HPEN hOldSepPen = (HPEN)SelectObject(hdc, hSepPen);
+                MoveToEx(hdc, rcItem.right - 1, rcItem.top + 4, NULL);
+                LineTo(hdc, rcItem.right - 1, rcItem.bottom - 4);
+                SelectObject(hdc, hOldSepPen);
+                DeleteObject(hSepPen);
+            }
+        }
+
+        // [修正] 元のフォントに戻す
+        SelectObject(hdc, hOldFont);
+
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hWnd, HeaderSubclassProc, uIdSubclass);
+        break;
+    }
+
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
 }
