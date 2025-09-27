@@ -89,6 +89,7 @@ COLORREF g_clrSelection;
 COLORREF g_clrSelectionText;
 COLORREF g_clrHot;
 COLORREF g_clrHeaderBg;
+static UINT g_dpi = 96;
 static HBRUSH g_hbrBg = NULL;
 static HBRUSH g_hbrHeaderBg = NULL;
 #ifndef HSIS_SORTEDUP
@@ -192,6 +193,10 @@ LRESULT CALLBACK CustomTabSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWO
 LRESULT CALLBACK TabCtrlSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 int CalculateNameColumnWidth(ExplorerTabData* pData);
 LRESULT CALLBACK HeaderSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
+void CreateAndSetFonts(HWND hWnd);
+int ScaleValue(int value) {
+    return MulDiv(value, g_dpi, 96);
+}
 ExplorerTabData* GetCurrentTabData() {
     int sel = TabCtrl_GetCurSel(hTab);
     if (sel >= 0 && sel < (int)g_tabs.size()) {
@@ -1425,13 +1430,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     case WM_CREATE:
     {
-        hFont = CreateFontW(20, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, 0, L"Segoe UI");
+        g_dpi = GetDpiForWindow(hWnd);
         MARGINS margins = { 0, 0, 1, 0 };
         DwmExtendFrameIntoClientArea(hWnd, &margins);
         SetWindowPos(hWnd, NULL, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER);
         hTab = CreateWindowW(WC_TABCONTROLW, 0, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_OWNERDRAWFIXED,
             0, 0, 0, 0, hWnd, (HMENU)IDC_TAB, ((LPCREATESTRUCT)lParam)->hInstance, NULL);
-        SendMessage(hTab, WM_SETFONT, (WPARAM)hFont, TRUE);
         TabCtrl_SetPadding(hTab, 18, 5);
         SetWindowSubclass(hTab, CustomTabSubclassProc, 0, 0);
         SetWindowSubclass(hTab, TabCtrlSubclassProc, 0, 0);
@@ -1439,23 +1443,33 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             0, 0, 24, 24, hWnd, (HMENU)IDC_ADD_TAB_BUTTON, ((LPCREATESTRUCT)lParam)->hInstance, NULL);
         hPathEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | WS_BORDER,
             0, 0, 0, 0, hWnd, (HMENU)IDC_PATH_EDIT, ((LPCREATESTRUCT)lParam)->hInstance, NULL);
-        SendMessage(hPathEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
         SetWindowSubclass(hPathEdit, PathEditSubclassProc, 0, 0);
         SHAutoComplete(hPathEdit, SHACF_FILESYS_DIRS | SHACF_AUTOSUGGEST_FORCE_ON | SHACF_AUTOAPPEND_FORCE_ON);
-        LOGFONTW lf = { 0 };
-        GetObject(hFont, sizeof(lf), &lf);
-        lf.lfHeight = 22;
-        lf.lfWeight = FW_LIGHT;
-        HFONT hAddButtonFont = CreateFontIndirectW(&lf);
-        SendMessage(hAddButton, WM_SETFONT, (WPARAM)hAddButtonFont, TRUE);
+        CreateAndSetFonts(hWnd);
+        int iconSize = GetSystemMetrics(SM_CXICON);
+        hImgList = ImageList_Create(iconSize, iconSize, ILC_COLOR32 | ILC_MASK, 1, 1);
+        if (!hImgList) {
+            return -1;
+        }
         SHFILEINFO sfi = { 0 };
-        hImgList = (HIMAGELIST)SHGetFileInfoW(
-            L"dummy",
-            FILE_ATTRIBUTE_NORMAL,
-            &sfi,
-            sizeof(sfi),
-            SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES
-        );
+        UINT flags = SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES;
+        if (iconSize > 16) {
+            flags |= SHGFI_LARGEICON;
+        }
+        else {
+            flags |= SHGFI_SMALLICON;
+        }
+        HIMAGELIST hSystemImageList = (HIMAGELIST)SHGetFileInfoW(L"dummy", FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi), flags);
+        if (hSystemImageList) {
+            ImageList_Add(hImgList, NULL, NULL); // インデックス0を予約
+            for (int i = 1; i < ImageList_GetImageCount(hSystemImageList); ++i) {
+                HICON hIcon = ImageList_GetIcon(hSystemImageList, i, ILD_TRANSPARENT);
+                if (hIcon) {
+                    ImageList_ReplaceIcon(hImgList, -1, hIcon);
+                    DestroyIcon(hIcon);
+                }
+            }
+        }
         UpdateTheme(hWnd);
         WCHAR initialPath[MAX_PATH];
         GetCurrentDirectoryW(MAX_PATH, initialPath);
@@ -1617,6 +1631,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         InvalidateRect(hWnd, NULL, TRUE);
     }
     break;
+    case WM_DPICHANGED: {
+        g_dpi = HIWORD(wParam);
+        RECT* newRect = reinterpret_cast<RECT*>(lParam);
+        SetWindowPos(hWnd, NULL, newRect->left, newRect->top, newRect->right - newRect->left, newRect->bottom - newRect->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        CreateAndSetFonts(hWnd);
+        UpdateLayout(hWnd);
+        return 0;
+    }
     case WM_SIZE:
         UpdateCaptionButtonsRect(hWnd);
         UpdateLayout(hWnd);
@@ -1971,11 +1993,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                             WCHAR fullpath[MAX_PATH];
                             PathCombineW(fullpath, pData->currentPath, fd.cFileName);
                             SHFILEINFO sfi = { 0 };
-                            SHGetFileInfoW(fullpath,
-                                fd.dwFileAttributes,
-                                &sfi,
-                                sizeof(sfi),
-                                SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+                            UINT flags = SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX;
+                            int iconSize = GetSystemMetricsForDpi(SM_CXSMICON, g_dpi); // 適切なアイコンサイズを取得
+                            if (iconSize > 16) {
+                                flags |= SHGFI_LARGEICON;
+                            }
+                            else {
+                                flags |= SHGFI_SMALLICON;
+                            }
+                            SHGetFileInfoW(fullpath, fd.dwFileAttributes, &sfi, sizeof(sfi), flags);
                             info.iIcon = sfi.iIcon;
                             auto it = std::find_if(pData->allFileData.begin(), pData->allFileData.end(),
                                 [&](const FileInfo& master_info) {
@@ -2126,9 +2152,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         for (const auto& tab : g_tabs) {
             if (tab->searchTimerId) KillTimer(hWnd, tab->searchTimerId);
         }
-        DeleteObject(hFont);
+        if (hFont) DeleteObject(hFont);
         DeleteObject((HGDIOBJ)SendMessage(hAddButton, WM_GETFONT, 0, 0));
         DeleteCriticalSection(&g_cacheLock);
+        if (hImgList) {
+            ImageList_Destroy(hImgList);
+            hImgList = NULL;
+        }
         PostQuitMessage(0);
         break;
     default:
@@ -2212,36 +2242,43 @@ void SwitchTab(HWND hWnd, int newIndex) {
 void UpdateLayout(HWND hWnd) {
     RECT rcClient;
     GetClientRect(hWnd, &rcClient);
-    constexpr int TITLEBAR_HEIGHT = 32;
-    constexpr int PATH_EDIT_WIDTH = 250;
-    constexpr int PATH_EDIT_MARGIN = 4;
-    constexpr int ADD_BUTTON_WIDTH = 22;
-    constexpr int ADD_BUTTON_MARGIN = 4;
-    RECT rcAdjust = { 0, 0, 0, 0 };
-    TabCtrl_AdjustRect(hTab, TRUE, &rcAdjust);
-    int tabHeight = -rcAdjust.top;
-    int tabY = TITLEBAR_HEIGHT - tabHeight;
-    int pathEditHeight = 24;
-    int pathEditY = (TITLEBAR_HEIGHT - pathEditHeight) / 2;
-    int addButtonY = (TITLEBAR_HEIGHT - ADD_BUTTON_WIDTH) / 2;
+
+    // タイトルバーの高さはDWMが管理するため、固定値は避け、動的に計算
+    const int captionHeight = GetSystemMetricsForDpi(SM_CYCAPTION, g_dpi);
+    const int topMargin = captionHeight; // タイトルバーの下から配置を開始
+
+    const int pathEditHeight = ScaleValue(24);
+    const int pathEditMargin = ScaleValue(4);
+    const int pathEditWidth = ScaleValue(250);
+    const int addButtonSize = ScaleValue(24);
+    const int addButtonMargin = ScaleValue(4);
+
     int rightBoundary = g_rcMinButton.left;
-    int pathEditX = rightBoundary - PATH_EDIT_MARGIN - PATH_EDIT_WIDTH;
-    int addButtonX = pathEditX - ADD_BUTTON_MARGIN - ADD_BUTTON_WIDTH;
+
+    int pathEditX = rightBoundary - pathEditMargin - pathEditWidth;
+    int pathEditY = (topMargin - pathEditHeight) / 2;
+
+    int addButtonX = pathEditX - addButtonMargin - addButtonSize;
+    int addButtonY = (topMargin - addButtonSize) / 2;
+
     int tabWidth = addButtonX;
-    if (pathEditX < 0) pathEditX = 0;
-    if (addButtonX < 0) addButtonX = 0;
-    if (tabWidth < 0) tabWidth = 0;
+    int tabHeight = ScaleValue(28); // タブの高さをDPIスケーリング
+    int tabY = topMargin - tabHeight;
+
+    if (pathEditX < ScaleValue(50)) pathEditX = ScaleValue(50); // 最低限の左マージン
+    if (addButtonX < pathEditX - addButtonSize - addButtonMargin) addButtonX = pathEditX - addButtonSize - addButtonMargin;
+    if (tabWidth < ScaleValue(100)) tabWidth = ScaleValue(100);
+
     MoveWindow(hTab, 0, tabY, tabWidth, tabHeight, TRUE);
-    MoveWindow(hAddButton, addButtonX, addButtonY, ADD_BUTTON_WIDTH, ADD_BUTTON_WIDTH, TRUE);
-    MoveWindow(hPathEdit, pathEditX, pathEditY, PATH_EDIT_WIDTH, pathEditHeight, TRUE);
+    MoveWindow(hAddButton, addButtonX, addButtonY, addButtonSize, addButtonSize, TRUE);
+    MoveWindow(hPathEdit, pathEditX, pathEditY, pathEditWidth, pathEditHeight, TRUE);
     SetWindowPos(hAddButton, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     SetWindowPos(hPathEdit, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     int curSel = TabCtrl_GetCurSel(hTab);
     if (curSel != -1) {
         ExplorerTabData* pData = GetCurrentTabData();
         if (pData) {
-            int contentTop = TITLEBAR_HEIGHT;
-            MoveWindow(pData->hList, 0, contentTop, rcClient.right, rcClient.bottom - contentTop, TRUE);
+            MoveWindow(pData->hList, 0, captionHeight, rcClient.right, rcClient.bottom - captionHeight, TRUE);
             UpdateWindow(pData->hList);
         }
     }
@@ -2250,11 +2287,12 @@ void UpdateLayout(HWND hWnd) {
 void UpdateCaptionButtonsRect(HWND hWnd) {
     RECT rcClient;
     GetClientRect(hWnd, &rcClient);
-    constexpr int BTN_WIDTH = 47;
-    constexpr int BTN_HEIGHT = 32;
-    g_rcCloseButton = { rcClient.right - BTN_WIDTH, 0, rcClient.right, BTN_HEIGHT };
-    g_rcMaxButton = { g_rcCloseButton.left - BTN_WIDTH, 0, g_rcCloseButton.left, BTN_HEIGHT };
-    g_rcMinButton = { g_rcMaxButton.left - BTN_WIDTH, 0, g_rcMaxButton.left, BTN_HEIGHT };
+    const int btnWidth = ScaleValue(47);
+    const int btnHeight = ScaleValue(32);
+    const int margin = ScaleValue(1);
+    g_rcCloseButton = { rcClient.right - btnWidth, margin, rcClient.right - margin, btnHeight };
+    g_rcMaxButton = { g_rcCloseButton.left - btnWidth, margin, g_rcCloseButton.left, btnHeight };
+    g_rcMinButton = { g_rcMaxButton.left - btnWidth, margin, g_rcMaxButton.left, btnHeight };
 }
 void DrawCaptionButtons(HDC hdc, HWND hWnd) {
     COLORREF clrIcon, clrBg, clrHotBg, clrPressedBg, clrCloseHotBg, clrCloseIcon;
@@ -2436,6 +2474,7 @@ LRESULT CALLBACK TabCtrlSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
     return DefSubclassProc(hWnd, uMsg, wParam, lParam);
 }
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPreInst, LPWSTR pCmdLine, int nCmdShow) {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     enum class AppMode { Default, AllowDark, ForceDark, ForceLight, Max };
     using fnSetPreferredAppMode = AppMode(WINAPI*)(AppMode appMode);
     HMODULE hUxtheme = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -2446,7 +2485,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPreInst, LPWSTR pCmdLine, in
         }
     }
     InitializeCriticalSection(&g_cacheLock);
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     INITCOMMONCONTROLSEX ic = { sizeof(ic), ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES };
     InitCommonControlsEx(&ic);
@@ -2579,4 +2617,38 @@ LRESULT CALLBACK HeaderSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM 
         break;
     }
     return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
+void CreateAndSetFonts(HWND hWnd) {
+    // 既存のフォントを破棄する
+    if (hFont) {
+        DeleteObject(hFont);
+    }
+    HFONT hAddButtonFont = (HFONT)SendMessage(hAddButton, WM_GETFONT, 0, 0);
+    if (hAddButtonFont) {
+        DeleteObject(hAddButtonFont);
+    }
+
+    // 新しいDPIに基づきフォントを再作成
+    LOGFONTW lf = { 0 };
+    lf.lfHeight = -MulDiv(11, g_dpi, 96);
+    lf.lfWeight = FW_NORMAL;
+    StringCchCopyW(lf.lfFaceName, LF_FACESIZE, L"Segoe UI");
+    hFont = CreateFontIndirectW(&lf);
+
+    lf.lfHeight = -MulDiv(14, g_dpi, 96);
+    lf.lfWeight = FW_LIGHT;
+    hAddButtonFont = CreateFontIndirectW(&lf);
+
+    // 各コントロールにフォントを適用
+    SendMessage(hTab, WM_SETFONT, (WPARAM)hFont, TRUE);
+    SendMessage(hPathEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+    SendMessage(hAddButton, WM_SETFONT, (WPARAM)hAddButtonFont, TRUE);
+
+    // ListView にもフォントを適用
+    for (const auto& tab : g_tabs) {
+        if (tab && tab->hList) {
+            SendMessage(tab->hList, WM_SETFONT, (WPARAM)hFont, TRUE);
+        }
+    }
 }
