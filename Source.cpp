@@ -2231,17 +2231,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_tabs.clear();
 
         PostQuitMessage(0);
-        //if (g_hbrBg) DeleteObject(g_hbrBg);
-        //if (g_hbrHeaderBg) DeleteObject(g_hbrHeaderBg);
-        //for (const auto& tab : g_tabs) {
-        //    if (tab->searchTimerId) KillTimer(hWnd, tab->searchTimerId);
-        //}
-        //if (hFont) DeleteObject(hFont);
-        //DeleteObject((HGDIOBJ)SendMessage(hAddButton, WM_GETFONT, 0, 0));
-        //DeleteCriticalSection(&g_cacheLock);
-        //PostQuitMessage(0);
     }
-        break;
+    break;
     default:
         return DefWindowProc(hWnd, msg, wParam, lParam);
     }
