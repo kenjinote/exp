@@ -48,6 +48,8 @@ CRITICAL_SECTION g_cacheLock;
 std::map<std::wstring, std::wstring> g_sidNameCache;
 std::set<std::wstring> g_resolvingSids;
 static std::map<HWND, int> g_hoveredItems;
+static HANDLE g_hStopEvent;
+static volatile LONG g_pendingTasks = 0;
 #define WM_APP_OWNER_RESOLVED (WM_APP + 2)
 struct OwnerResolveParam {
     HWND hNotifyWnd;
@@ -60,6 +62,7 @@ struct OwnerResolveResult {
     std::wstring displayName;
     bool success;
 };
+#define FONT_SIZE 16
 #define IDC_TAB 1000
 #define LIST_ID_BASE 2001
 #define IDC_ADD_TAB_BUTTON 3001
@@ -309,6 +312,7 @@ DWORD WINAPI ResolveOwnerNameThread(LPVOID lpParam) {
     auto* result = new OwnerResolveResult{ param->sidString, displayName, success };
     PostMessage(param->hNotifyWnd, WM_APP_OWNER_RESOLVED, 0, (LPARAM)result);
     delete param;
+    InterlockedDecrement(&g_pendingTasks);
     return 0;
 }
 bool CompareFunction(const FileInfo& a, const FileInfo& b, ExplorerTabData* pData) {
@@ -380,13 +384,64 @@ ULONGLONG GetFolderSize(const std::wstring& folderPath) {
     FindClose(hFind);
     return totalSize;
 }
+ULONGLONG GetFolderSizeWithAbort(const std::wstring& folderPath) {
+    if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) {
+        return 0; // 中断信号を受信
+    }
+
+    ULONGLONG totalSize = 0;
+    WIN32_FIND_DATAW fd;
+    std::wstring searchPath = folderPath + L"\\*";
+    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return 0;
+
+    do {
+        if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) {
+            FindClose(hFind);
+            return 0; // 中断信号を受信
+        }
+        if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
+            std::wstring fullPath = folderPath + L"\\" + fd.cFileName;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                totalSize += GetFolderSizeWithAbort(fullPath);
+            }
+            else {
+                ULARGE_INTEGER fileSize;
+                fileSize.LowPart = fd.nFileSizeLow;
+                fileSize.HighPart = fd.nFileSizeHigh;
+                totalSize += fileSize.QuadPart;
+            }
+        }
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+    return totalSize;
+}
 DWORD WINAPI CalculateFolderSizeThread(LPVOID lpParam) {
     auto* param = static_cast<FolderSizeParam*>(lpParam);
-    if (!param) return 1;
-    ULONGLONG size = GetFolderSize(param->folderPath);
-    auto* result = new FolderSizeResult{ param->folderPath, size, true };
-    PostMessage(param->hNotifyWnd, WM_APP_FOLDER_SIZE_CALCULATED, 0, (LPARAM)result);
+    if (!param) {
+        InterlockedDecrement(&g_pendingTasks);
+        return 1;
+    }
+
+    bool aborted = false;
+    ULONGLONG size = 0;
+    if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) {
+        aborted = true;
+    }
+    else {
+        size = GetFolderSizeWithAbort(param->folderPath);
+        if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) {
+            aborted = true;
+        }
+    }
+
+    if (!aborted) {
+        auto* result = new FolderSizeResult{ param->folderPath, size, true };
+        PostMessage(param->hNotifyWnd, WM_APP_FOLDER_SIZE_CALCULATED, 0, (LPARAM)result);
+    }
+
     delete param;
+    InterlockedDecrement(&g_pendingTasks);
     return 0;
 }
 void ListDirectory(HWND hWnd, ExplorerTabData* pData) {
@@ -448,6 +503,7 @@ void ListDirectory(HWND hWnd, ExplorerTabData* pData) {
                 if (LookupAccountSidW(NULL, pSid, szAccountName, &dwAccSize, szDomainName, &dwDomSize, &use)) {
                     if (use == SidTypeUser) {
                         auto* param = new OwnerResolveParam{ hWnd, item.sidString, szAccountName, szDomainName };
+                        InterlockedIncrement(&g_pendingTasks);
                         QueueUserWorkItem(ResolveOwnerNameThread, param, WT_EXECUTEDEFAULT);
                     }
                     else {
@@ -475,6 +531,7 @@ void ListDirectory(HWND hWnd, ExplorerTabData* pData) {
             WCHAR fullPath[MAX_PATH];
             PathCombineW(fullPath, pData->currentPath, item.findData.cFileName);
             param->folderPath = fullPath;
+            InterlockedIncrement(&g_pendingTasks);
             QueueUserWorkItem(CalculateFolderSizeThread, param, WT_EXECUTEDEFAULT);
         }
     }
@@ -1447,10 +1504,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SHAutoComplete(hPathEdit, SHACF_FILESYS_DIRS | SHACF_AUTOSUGGEST_FORCE_ON | SHACF_AUTOAPPEND_FORCE_ON);
         CreateAndSetFonts(hWnd);
         int iconSize = GetSystemMetrics(SM_CXICON);
-        hImgList = ImageList_Create(iconSize, iconSize, ILC_COLOR32 | ILC_MASK, 1, 1);
-        if (!hImgList) {
-            return -1;
-        }
         SHFILEINFO sfi = { 0 };
         UINT flags = SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES;
         if (iconSize > 16) {
@@ -1459,17 +1512,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else {
             flags |= SHGFI_SMALLICON;
         }
-        HIMAGELIST hSystemImageList = (HIMAGELIST)SHGetFileInfoW(L"dummy", FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi), flags);
-        if (hSystemImageList) {
-            ImageList_Add(hImgList, NULL, NULL); // インデックス0を予約
-            for (int i = 1; i < ImageList_GetImageCount(hSystemImageList); ++i) {
-                HICON hIcon = ImageList_GetIcon(hSystemImageList, i, ILD_TRANSPARENT);
-                if (hIcon) {
-                    ImageList_ReplaceIcon(hImgList, -1, hIcon);
-                    DestroyIcon(hIcon);
-                }
-            }
-        }
+        hImgList = (HIMAGELIST)SHGetFileInfoW(L"dummy", FILE_ATTRIBUTE_DIRECTORY, &sfi, sizeof(sfi), flags);
         UpdateTheme(hWnd);
         WCHAR initialPath[MAX_PATH];
         GetCurrentDirectoryW(MAX_PATH, initialPath);
@@ -2147,19 +2190,57 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     break;
     case WM_DESTROY:
-        if (g_hbrBg) DeleteObject(g_hbrBg);
-        if (g_hbrHeaderBg) DeleteObject(g_hbrHeaderBg);
+    {
+        // 全てのタブのタイマーを停止
         for (const auto& tab : g_tabs) {
             if (tab->searchTimerId) KillTimer(hWnd, tab->searchTimerId);
         }
-        if (hFont) DeleteObject(hFont);
-        DeleteObject((HGDIOBJ)SendMessage(hAddButton, WM_GETFONT, 0, 0));
-        DeleteCriticalSection(&g_cacheLock);
-        if (hImgList) {
-            ImageList_Destroy(hImgList);
-            hImgList = NULL;
+
+        // 全てのワーカースレッドに終了を通知
+        SetEvent(g_hStopEvent);
+
+        // すべての非同期タスクが完了するまで待機
+        while (InterlockedAdd(&g_pendingTasks, 0) > 0) {
+            Sleep(50);
         }
+        // ハンドルを閉じる
+        CloseHandle(g_hStopEvent);
+        g_hStopEvent = NULL;
+        if (g_hbrBg) {
+            DeleteObject(g_hbrBg);
+            g_hbrBg = NULL;
+        }
+        if (g_hbrHeaderBg) {
+            DeleteObject(g_hbrHeaderBg);
+            g_hbrHeaderBg = NULL;
+        }
+        if (hFont) {
+            DeleteObject(hFont);
+            hFont = NULL;
+        }
+        HFONT hAddButtonFont = (HFONT)SendMessage(hAddButton, WM_GETFONT, 0, 0);
+        if (hAddButtonFont) {
+            DeleteObject(hAddButtonFont);
+            SendMessage(hAddButton, WM_SETFONT, (WPARAM)NULL, TRUE);
+        }
+
+        // クリティカルセクションを解放
+        DeleteCriticalSection(&g_cacheLock);
+
+        // メモリリークを防ぐため、タブデータをクリア
+        g_tabs.clear();
+
         PostQuitMessage(0);
+        //if (g_hbrBg) DeleteObject(g_hbrBg);
+        //if (g_hbrHeaderBg) DeleteObject(g_hbrHeaderBg);
+        //for (const auto& tab : g_tabs) {
+        //    if (tab->searchTimerId) KillTimer(hWnd, tab->searchTimerId);
+        //}
+        //if (hFont) DeleteObject(hFont);
+        //DeleteObject((HGDIOBJ)SendMessage(hAddButton, WM_GETFONT, 0, 0));
+        //DeleteCriticalSection(&g_cacheLock);
+        //PostQuitMessage(0);
+    }
         break;
     default:
         return DefWindowProc(hWnd, msg, wParam, lParam);
@@ -2212,12 +2293,12 @@ void AddNewTab(HWND hWnd, LPCWSTR initialPath) {
 }
 void CloseTab(HWND hWnd, int index) {
     if (index < 0 || index >= (int)g_tabs.size()) return;
+    ListView_SetImageList(g_tabs[index]->hList, NULL, LVSIL_SMALL);
+    DestroyWindow(g_tabs[index]->hList);
     if (g_tabs.size() <= 1) {
         DestroyWindow(hWnd);
         return;
     }
-    ExplorerTabData* pData = g_tabs[index].get();
-    DestroyWindow(pData->hList);
     g_tabs.erase(g_tabs.begin() + index);
     TabCtrl_DeleteItem(hTab, index);
     int newSel = (index >= TabCtrl_GetItemCount(hTab)) ? (TabCtrl_GetItemCount(hTab) - 1) : index;
@@ -2484,6 +2565,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPreInst, LPWSTR pCmdLine, in
             pfnSetPreferredAppMode(AppMode::AllowDark);
         }
     }
+    g_hStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     InitializeCriticalSection(&g_cacheLock);
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     INITCOMMONCONTROLSEX ic = { sizeof(ic), ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES };
@@ -2631,7 +2713,7 @@ void CreateAndSetFonts(HWND hWnd) {
 
     // 新しいDPIに基づきフォントを再作成
     LOGFONTW lf = { 0 };
-    lf.lfHeight = -MulDiv(11, g_dpi, 96);
+    lf.lfHeight = -MulDiv(FONT_SIZE, g_dpi, 96);
     lf.lfWeight = FW_NORMAL;
     StringCchCopyW(lf.lfFaceName, LF_FACESIZE, L"Segoe UI");
     hFont = CreateFontIndirectW(&lf);
